@@ -1,0 +1,77 @@
+name: Fjall Deploy
+description: Deploy, destroy, or build Fjall applications on AWS
+author: https://github.com/fjall-tech
+requirements:
+  - npm
+  - node
+
+configuration:
+  properties:
+    command:
+      type: string
+      enum:
+        - deploy
+        - destroy
+        - build
+      default: deploy
+    target:
+      type: string
+    service:
+      type: string
+    mode:
+      type: string
+      enum:
+        - full
+        - infra-only
+        - deploy-only
+      default: full
+    environment:
+      type: string
+    deploy-target:
+      type: string
+    verbose:
+      type: boolean
+      default: false
+    skip-build:
+      type: boolean
+      default: false
+    skip-migrations:
+      type: boolean
+      default: false
+    no-cascade:
+      type: boolean
+      default: false
+    region:
+      type: string
+    image-tag:
+      type: string
+    plan:
+      type: boolean
+      default: false
+    require-approval:
+      type: boolean
+      default: false
+    auto-approve:
+      type: boolean
+      default: false
+    approval-token:
+      type: string
+    build-args:
+      type: array
+      items:
+        type: string
+    build-secrets:
+      type: array
+      items:
+        type: string
+    cli-version:
+      type: string
+      default: "4"
+    working-directory:
+      type: string
+      default: "."
+    force:
+      type: boolean
+      default: false
+  required:
+    - target
