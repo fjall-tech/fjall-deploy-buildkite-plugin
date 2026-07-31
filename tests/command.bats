@@ -16,8 +16,8 @@ setup() {
 
   # Create a stub for npm. With no cli-version set, the hook defaults to
   # FJALL_CLI_DEFAULT_MAJOR (design § 5.2 version tie), so the default install
-  # is `fjall@4`, not bare `fjall`.
-  stub npm "install -g fjall@4 : echo 'installed fjall@4'"
+  # is `fjall@5`, not bare `fjall`.
+  stub npm "install -g fjall@5 : echo 'installed fjall@5'"
 
   # Create a stub for fjall. The second plan line uses the `::` unconditional
   # form — a bare `*` pattern only matches single-argument invocations in
@@ -303,7 +303,7 @@ teardown() {
     "--version : echo 'v22.14.0'" \
     ":: echo 'fjall@7'"
 
-  # setup()'s npm plan expects `install -g fjall@4`; the resolver echoed 7, so
+  # setup()'s npm plan expects `install -g fjall@5`; the resolver echoed 7, so
   # drain and re-stub for the resolved spec.
   unstub npm || true
   stub npm "install -g fjall@7 : echo 'installed fjall@7'"
@@ -323,7 +323,7 @@ teardown() {
 # major. The hook MUST abort the step, never guessing a major, and never reach
 # npm or fjall. setup()'s npm plan is left in place: if the hook wrongly
 # proceeded past the failed resolver it would call npm with an empty spec, which
-# does not match `install -g fjall@4`, turning the test red rather than passing.
+# does not match `install -g fjall@5`, turning the test red rather than passing.
 @test "cli-version auto fails the step when the engine resolver cannot resolve a major" {
   node --version > /dev/null
   unstub node
