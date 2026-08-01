@@ -546,7 +546,7 @@ teardown() {
   unstub sha256sum
   unstub tar
   assert_success
-  assert_output --partial "Bootstrapping Node 22.14.0"
+  assert_output --partial "Bootstrapping Node 24.18.1"
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
 }
 
@@ -573,7 +573,7 @@ teardown() {
   unstub curl
   unstub sha256sum
   assert_failure
-  assert_output --partial "Bootstrapping Node 22.14.0"
+  assert_output --partial "Bootstrapping Node 24.18.1"
   refute_output --partial "EXTRACTED"
   refute_output --partial "ci run"
 }

@@ -13,9 +13,9 @@ FJALL_CLI_DEFAULT_MAJOR="5"
 # against a pinned SHA-256 before use — a tampered or truncated tarball aborts
 # the run rather than executing. Bump the version and BOTH per-arch digests
 # together from https://nodejs.org/dist/v<version>/SHASUMS256.txt.
-NODE_VERSION="22.14.0"
-NODE_SHA256_X64="69b09dba5c8dcb05c4e4273a4340db1005abeafe3927efda2bc5b249e80437ec"
-NODE_SHA256_ARM64="08bfbf538bad0e8cbb0269f0173cca28d705874a67a22f60b57d99dc99e30050"
+NODE_VERSION="24.18.1"
+NODE_SHA256_X64="d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0"
+NODE_SHA256_ARM64="7201e3a09dc825bac57867c81913e2b8f0ef87d04cb9082af4cda82f6ff3d88c"
 
 # Read plugin configuration
 COMMAND="${BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND:-deploy}"
