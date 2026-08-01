@@ -12,7 +12,7 @@ A tier `target` (`organisation`, `platform`, or `account`) routes to the noun-ve
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
 ```
 
@@ -38,7 +38,7 @@ steps:
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
       AWS_REGION: "us-east-2"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
 ```
 
@@ -52,7 +52,7 @@ steps:
     plugins:
       - aws-assume-role-with-web-identity#v1.0.0:
           role-arn: arn:aws:iam::123456789012:role/deploy
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
 ```
 
@@ -102,7 +102,7 @@ A `plan-pending` result also posts a warning annotation with re-run instructions
 steps:
   - label: ":construction: Infra"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
           mode: infra-only
 ```
@@ -114,7 +114,7 @@ steps:
   - label: ":package: Code"
     depends_on: infra
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
           mode: deploy-only
 ```
@@ -125,7 +125,7 @@ steps:
 steps:
   - label: ":fire: Destroy"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           command: destroy
           target: my-app
           force: true
@@ -137,7 +137,7 @@ steps:
 steps:
   - label: ":whale: API"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
           service: api
           mode: deploy-only
@@ -151,7 +151,7 @@ A tier `target` routes to the noun-verb tier command. This runs `fjall org deplo
 steps:
   - label: ":earth_africa: Organisation"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: organisation
           no-cascade: true
 ```
@@ -162,7 +162,7 @@ steps:
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
           cli-version: "0.88.3"
 ```
@@ -173,7 +173,7 @@ steps:
 steps:
   - label: ":test_tube: Staging"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
           environment: staging
 
@@ -183,7 +183,7 @@ steps:
 
   - label: ":rocket: Production"
     plugins:
-      - fjall-tech/fjall-deploy#v1.1.0:
+      - fjall-tech/fjall-deploy#v2.0.0:
           target: my-app
           environment: production
           skip-build: true
