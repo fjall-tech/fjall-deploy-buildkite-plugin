@@ -18,7 +18,7 @@ steps:
 
 ## Authentication
 
-The CLI authenticates to Fjall via `FJALL_API_KEY` — mint an app-scoped deploy token with `fjall ci token create` (or `fjall ci setup`) and store it as a [Buildkite secret](https://buildkite.com/docs/pipelines/security/secrets) named `FJALL_API_KEY`. If the environment does not already export `FJALL_API_KEY`, the plugin fetches it from the secret store via `buildkite-agent secret get FJALL_API_KEY`, so you need only store the secret — no `env:` wiring required. Exporting it as an environment variable still works and takes precedence.
+The CLI authenticates to Fjall via `FJALL_API_KEY` — an app-scoped `fjall_dk_` deploy token. Deploy tokens are minted from a signed-in browser session by an owner or admin (**Settings → CI/CD Tokens** in the [Fjall dashboard](https://fjall.io)); CLI mint paths are refused by design, so `fjall ci token create` can only direct you there. Tokens expire after at most 90 days — re-mint from the same page and update the secret to rotate. Store the token as a [Buildkite secret](https://buildkite.com/docs/pipelines/security/secrets) named `FJALL_API_KEY`. If the environment does not already export `FJALL_API_KEY`, the plugin fetches it from the secret store via `buildkite-agent secret get FJALL_API_KEY`, so you need only store the secret — no `env:` wiring required. Exporting it as an environment variable still works and takes precedence.
 
 AWS credentials must also be available in the build environment before the plugin runs. Common approaches:
 
@@ -94,6 +94,30 @@ After the run, the plugin records results as [build meta-data](https://buildkite
 
 A `plan-pending` result also posts a warning annotation with re-run instructions, and the step exits `2` so downstream steps can gate on it.
 
+## Verifying a Deploy
+
+`fjall-deploy:result` answers "did the step succeed". To confirm what actually shipped, the CLI's read commands work anywhere the same `FJALL_API_KEY` is available (including a follow-up step):
+
+- `fjall deployments list` — your organisation's active and recent deployments: who triggered each, from where, and its current state
+- `fjall releases <app>` — the app's recorded releases with their image tags: what is live now, and what a rollback can target
+- `fjall status <app>` — the deployed infrastructure's current health
+
+## Serialising Deploys
+
+Fjall allows one active deployment per app (the deploy slot). Give every deploy step for the same app a shared concurrency group — the same shape `fjall ci setup` scaffolds — so overlapping builds queue instead of contending for the slot:
+
+```yaml
+steps:
+  - label: ":rocket: Deploy"
+    concurrency_group: "fjall-deploy-my-app"
+    concurrency: 1
+    plugins:
+      - fjall-tech/fjall-deploy#v3.0.0:
+          target: my-app
+```
+
+Pair this with the pipeline settings **Skip Intermediate Builds: ON** (queued stale deploys collapse to the newest) and **Cancel Intermediate Builds: OFF** (never interrupt an in-flight CloudFormation update).
+
 ## Examples
 
 ### Infrastructure Only
@@ -156,6 +180,21 @@ steps:
           no-cascade: true
 ```
 
+### Roll Back to a Previous Image
+
+`image-tag` re-deploys an existing image without rebuilding (implies `deploy-only`):
+
+```yaml
+steps:
+  - label: ":rewind: Roll back"
+    plugins:
+      - fjall-tech/fjall-deploy#v3.0.0:
+          target: my-app
+          image-tag: "sha-4f9c2ab"
+```
+
+Find valid tags with `fjall releases my-app` (each release records the image tags it shipped), from the original deploy's output, or from the app's ECR repository. An image-tag rollback re-pins application code only — it does not revert infrastructure changes or roll back database migrations.
+
 ### Pin CLI Version
 
 ```yaml
@@ -164,7 +203,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v3.0.0:
           target: my-app
-          cli-version: "0.88.3"
+          cli-version: "7.0.0"
 ```
 
 ### Staging to Production Pipeline
@@ -189,10 +228,47 @@ steps:
           skip-build: true
 ```
 
+## Versioning
+
+Two pins interact, and they move together:
+
+- **The plugin ref** — `fjall-tech/fjall-deploy#v3` is a moving major tag, repointed at the latest 3.x release on each plugin republish; `#v3.0.0` pins an exact release for maximum determinism.
+- **`cli-version`** — the `fjall` CLI the plugin installs per run; it defaults to the plugin major's compatible CLI major.
+
+Upgrade majors deliberately: a new plugin major defaults to a new CLI major, so bump the plugin ref and any explicit `cli-version` pin in the same change.
+
+## Troubleshooting
+
+### Blocked deploy slot
+
+> Blocked: Jane has been deploying my-app from CI since 03/08/2026, 14:02:11 (deployment cmd0a1b2c…). View progress in the Fjall dashboard: …
+
+Fjall allows one active deployment per app. A deploy that starts while another is in flight is refused with the message above — wait for the active deployment to finish (or cancel it from the dashboard), then retry. `fjall deployments list` shows your organisation's active deployments. Prevent the contention with a concurrency group ([Serialising Deploys](#serialising-deploys)).
+
+### "This deployment requires a newer fjall CLI"
+
+The Fjall API refuses deploys from a CLI older than the app's engine floor. The refusal suggests `npm install -g @fjall/cli@latest` — correct for a workstation, wrong here: the plugin installs the CLI per run from `cli-version`, so upgrading the agent's global CLI changes nothing. Fix it in the pipeline instead:
+
+- bump `cli-version` to the required major (or a newer exact version), or
+- set `cli-version: auto` to derive the major from the app's pinned `@fjall/components-infrastructure`, or
+- move to a newer plugin major (each plugin major defaults `cli-version` to its compatible CLI major).
+
+### Authentication failures
+
+Two different credentials can fail — the error tells you which:
+
+- **Fjall API errors** (401/403 from the Fjall API) mean `FJALL_API_KEY` is missing, expired, or revoked. Deploy tokens live at most 90 days: mint a replacement in the dashboard (**Settings → CI/CD Tokens**) and update the Buildkite secret.
+- **AWS SDK errors** (`ExpiredToken`, `AccessDenied`, credential-chain failures naming AWS services) mean the build environment's AWS credentials are wrong — see [Authentication](#authentication).
+
+### `docker: command not found`
+
+Any deploy or build that produces a container image runs Docker on the agent. Install Docker on self-hosted agents; only `image-tag` and `skip-build` deploys avoid the image build.
+
 ## Requirements
 
 - Node.js >= 22 — if the agent's node is older (or absent), the plugin bootstraps a pinned Node build from nodejs.org, SHA-256-verified before use (a Linux agent with `curl` and `tar` is required for the bootstrap path)
 - npm
+- Docker — required for any deploy or build that produces a container image (`image-tag` / `skip-build` deploys excepted)
 - AWS credentials available in the environment
 
 ## Running Tests
