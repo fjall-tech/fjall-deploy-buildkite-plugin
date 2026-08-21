@@ -16,8 +16,15 @@ setup() {
 
   # Create a stub for npm. With no cli-version set, the hook defaults to
   # FJALL_CLI_DEFAULT_MAJOR (design § 5.2 version tie), so the default install
-  # is `fjall@6`, not bare `fjall`.
-  stub npm "install -g fjall@6 : echo 'installed fjall@6'"
+  # is `fjall@<that major>`, not bare `fjall`. Derived from the hook rather
+  # than restated: a hardcoded major here silently rotted across two CLI
+  # majors before this suite first ran in CI.
+  FJALL_CLI_DEFAULT_MAJOR="$(sed -n 's/^FJALL_CLI_DEFAULT_MAJOR="\([0-9][0-9]*\)"$/\1/p' "$PWD/hooks/command")"
+  [ -n "$FJALL_CLI_DEFAULT_MAJOR" ] || {
+    echo "could not read FJALL_CLI_DEFAULT_MAJOR from hooks/command" >&2
+    return 1
+  }
+  stub npm "install -g fjall@${FJALL_CLI_DEFAULT_MAJOR} : echo 'installed fjall@${FJALL_CLI_DEFAULT_MAJOR}'"
 
   # Create a stub for fjall. The second plan line uses the `::` unconditional
   # form — a bare `*` pattern only matches single-argument invocations in
@@ -295,16 +302,16 @@ teardown() {
   # calls the auto path makes: the bootstrap `node --version` check, then the
   # `node <resolver> <workdir>` invocation. The second plan line uses the `::`
   # unconditional form so it matches the resolver's multi-arg invocation. Echo a
-  # major (7) that is NOT the baked default (4) so the assertion proves the
-  # resolver's output drove the install, not the fallback.
+  # major (7) that differs from the hook's FJALL_CLI_DEFAULT_MAJOR so the
+  # assertion proves the resolver's output drove the install, not the fallback.
   node --version > /dev/null
   unstub node
   stub node \
     "--version : echo 'v22.14.0'" \
     ":: echo 'fjall@7'"
 
-  # setup()'s npm plan expects `install -g fjall@6`; the resolver echoed 7, so
-  # drain and re-stub for the resolved spec.
+  # setup()'s npm plan expects the baked default major; the resolver echoed 7,
+  # so drain and re-stub for the resolved spec.
   unstub npm || true
   stub npm "install -g fjall@7 : echo 'installed fjall@7'"
 
@@ -323,7 +330,7 @@ teardown() {
 # major. The hook MUST abort the step, never guessing a major, and never reach
 # npm or fjall. setup()'s npm plan is left in place: if the hook wrongly
 # proceeded past the failed resolver it would call npm with an empty spec, which
-# does not match `install -g fjall@6`, turning the test red rather than passing.
+# does not match setup()'s plan, turning the test red rather than passing.
 @test "cli-version auto fails the step when the engine resolver cannot resolve a major" {
   node --version > /dev/null
   unstub node
@@ -591,7 +598,9 @@ teardown() {
   refute_output --partial "ci run"
 }
 
-# The guard also fires per-item inside the build-args / build-secrets loops.
+# The guard also fires per item for the array properties, and BEFORE any
+# side-effecting phase — no install stubs here, so reaching the token fetch
+# or Node bootstrap fails the test on their absence.
 @test "a flag-shaped build-arg is rejected per item" {
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_0="--sneaky=1"
@@ -600,4 +609,16 @@ teardown() {
 
   assert_failure
   assert_output --partial "'build-args' must not begin with '-'"
+  refute_output --partial "Installing fjall"
+}
+
+@test "a flag-shaped build-secret is rejected per item" {
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS_0="--sneaky=id=x"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'build-secrets' must not begin with '-'"
+  refute_output --partial "Installing fjall"
 }

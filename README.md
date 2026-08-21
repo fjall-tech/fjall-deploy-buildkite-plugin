@@ -12,7 +12,7 @@ A tier `target` (`organisation`, `platform`, or `account`) routes to the noun-ve
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
 ```
 
@@ -38,7 +38,7 @@ steps:
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
       AWS_REGION: "us-east-2"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
 ```
 
@@ -52,35 +52,35 @@ steps:
     plugins:
       - aws-assume-role-with-web-identity#v1.0.0:
           role-arn: arn:aws:iam::123456789012:role/deploy
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
 ```
 
 ## Configuration
 
-| Property            | Required | Default  | Description                                                                                                                                                                                                                                                                 |
-| ------------------- | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `command`           | no       | `deploy` | `deploy`, `destroy`, or `build`                                                                                                                                                                                                                                             |
-| `target`            | **yes**  | —        | Application name, or a tier: `organisation`, `platform`, `account`. App targets run the app; tier targets route to the noun-verb tier command (`fjall org\|platform\|account deploy\|destroy`). `build` is app-only                                                         |
-| `service`           | no       | —        | Specific service name (deploy and build only)                                                                                                                                                                                                                               |
-| `mode`              | no       | `full`   | `full`, `infra-only`, or `deploy-only` (deploy only)                                                                                                                                                                                                                        |
-| `environment`       | no       | —        | Target environment                                                                                                                                                                                                                                                          |
-| `deploy-target`     | no       | —        | Deploy to a specific `fjall target list` target, e.g. `production-use1`; maps to `--target` (the credential where), distinct from `environment`. App targets only                                                                                                           |
-| `verbose`           | no       | `false`  | Enable CloudFormation event logging                                                                                                                                                                                                                                         |
-| `skip-build`        | no       | `false`  | Skip Docker build (reuse existing image)                                                                                                                                                                                                                                    |
-| `skip-migrations`   | no       | `false`  | Skip database migrations during this deployment                                                                                                                                                                                                                             |
-| `no-cascade`        | no       | `false`  | Skip the platform/account cascade around an `organisation` deploy or destroy (rejected for any other target)                                                                                                                                                                |
-| `region`            | no       | —        | Deploy to a specific region within the target's account                                                                                                                                                                                                                     |
-| `image-tag`         | no       | —        | Roll forward/back to an existing image tag (implies deploy-only)                                                                                                                                                                                                            |
-| `plan`              | no       | `false`  | Compute and print the change plan, then stop before any mutation                                                                                                                                                                                                            |
-| `require-approval`  | no       | `false`  | Refuse to mutate unless the plan is approved                                                                                                                                                                                                                                |
-| `auto-approve`      | no       | `false`  | Approve the computed plan without prompting                                                                                                                                                                                                                                 |
-| `approval-token`    | no       | —        | Resume an approved plan from a prior plan run                                                                                                                                                                                                                               |
-| `build-args`        | no       | —        | Public build-time args, a list of `KEY=VALUE` strings                                                                                                                                                                                                                       |
-| `build-secrets`     | no       | —        | Build secret refs, a list of `id=ID,ssm=PATH` (or `env=VAR`) strings                                                                                                                                                                                                        |
-| `cli-version`       | no       | `7`      | Pin the `fjall` CLI version. Defaults to this plugin's compatible major (floats across `7`.x, never crossing into the next major); `auto` derives the major from the app's pinned `@fjall/components-infrastructure`; `latest` always installs the newest published release |
-| `working-directory` | no       | `.`      | Directory containing `fjall-config.json`                                                                                                                                                                                                                                    |
-| `force`             | no       | `false`  | Deploy: redeploy unchanged stacks. Destroy: skip confirmation                                                                                                                                                                                                               |
+| Property            | Required | Default  | Description                                                                                                                                                                                                                                                                  |
+| ------------------- | -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`           | no       | `deploy` | `deploy`, `destroy`, or `build`                                                                                                                                                                                                                                              |
+| `target`            | **yes**  | —        | Application name, or a tier: `organisation`, `platform`, `account`. App targets run the app; tier targets route to the noun-verb tier command (`fjall org\|platform\|account deploy\|destroy`). `build` is app-only                                                          |
+| `service`           | no       | —        | Specific service name (deploy and build only)                                                                                                                                                                                                                                |
+| `mode`              | no       | `full`   | `full`, `infra-only`, or `deploy-only` (deploy only)                                                                                                                                                                                                                         |
+| `environment`       | no       | —        | Target environment                                                                                                                                                                                                                                                           |
+| `deploy-target`     | no       | —        | Deploy to a specific `fjall target list` target, e.g. `production-use1`; maps to `--target` (the credential where), distinct from `environment`. App targets only                                                                                                            |
+| `verbose`           | no       | `false`  | Enable CloudFormation event logging                                                                                                                                                                                                                                          |
+| `skip-build`        | no       | `false`  | Skip Docker build (reuse existing image)                                                                                                                                                                                                                                     |
+| `skip-migrations`   | no       | `false`  | Skip database migrations during this deployment                                                                                                                                                                                                                              |
+| `no-cascade`        | no       | `false`  | Skip the platform/account cascade around an `organisation` deploy or destroy (rejected for any other target)                                                                                                                                                                 |
+| `region`            | no       | —        | Deploy to a specific region within the target's account                                                                                                                                                                                                                      |
+| `image-tag`         | no       | —        | Roll forward/back to an existing image tag (implies deploy-only)                                                                                                                                                                                                             |
+| `plan`              | no       | `false`  | Compute and print the change plan, then stop before any mutation                                                                                                                                                                                                             |
+| `require-approval`  | no       | `false`  | Refuse to mutate unless the plan is approved                                                                                                                                                                                                                                 |
+| `auto-approve`      | no       | `false`  | Approve the computed plan without prompting                                                                                                                                                                                                                                  |
+| `approval-token`    | no       | —        | Resume an approved plan from a prior plan run                                                                                                                                                                                                                                |
+| `build-args`        | no       | —        | Public build-time args, a list of `KEY=VALUE` strings                                                                                                                                                                                                                        |
+| `build-secrets`     | no       | —        | Build secret refs, a list of `id=ID,ssm=PATH` (or `env=VAR`) strings                                                                                                                                                                                                         |
+| `cli-version`       | no       | `14`     | Pin the `fjall` CLI version. Defaults to this plugin's compatible major (floats across `14`.x, never crossing into the next major); `auto` derives the major from the app's pinned `@fjall/components-infrastructure`; `latest` always installs the newest published release |
+| `working-directory` | no       | `.`      | Directory containing `fjall-config.json`                                                                                                                                                                                                                                     |
+| `force`             | no       | `false`  | Deploy: redeploy unchanged stacks. Destroy: skip confirmation                                                                                                                                                                                                                |
 
 ## Outputs
 
@@ -112,7 +112,7 @@ steps:
     concurrency_group: "fjall-deploy-my-app"
     concurrency: 1
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
 ```
 
@@ -126,7 +126,7 @@ Pair this with the pipeline settings **Skip Intermediate Builds: ON** (queued st
 steps:
   - label: ":construction: Infra"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
           mode: infra-only
 ```
@@ -138,7 +138,7 @@ steps:
   - label: ":package: Code"
     depends_on: infra
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
           mode: deploy-only
 ```
@@ -149,7 +149,7 @@ steps:
 steps:
   - label: ":fire: Destroy"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           command: destroy
           target: my-app
           force: true
@@ -161,7 +161,7 @@ steps:
 steps:
   - label: ":whale: API"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
           service: api
           mode: deploy-only
@@ -175,7 +175,7 @@ A tier `target` routes to the noun-verb tier command. This runs `fjall org deplo
 steps:
   - label: ":earth_africa: Organisation"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: organisation
           no-cascade: true
 ```
@@ -188,7 +188,7 @@ steps:
 steps:
   - label: ":rewind: Roll back"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
           image-tag: "sha-4f9c2ab"
 ```
@@ -201,7 +201,7 @@ Find valid tags with `fjall releases my-app` (each release records the image tag
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
           cli-version: "7.0.0"
 ```
@@ -212,7 +212,7 @@ steps:
 steps:
   - label: ":test_tube: Staging"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
           environment: staging
 
@@ -222,7 +222,7 @@ steps:
 
   - label: ":rocket: Production"
     plugins:
-      - fjall-tech/fjall-deploy#v3.0.0:
+      - fjall-tech/fjall-deploy#v4.0.0:
           target: my-app
           environment: production
           skip-build: true
@@ -232,7 +232,7 @@ steps:
 
 Two pins interact, and they move together:
 
-- **The plugin ref** — `fjall-tech/fjall-deploy#v3` is a moving major tag, repointed at the latest 3.x release on each plugin republish; `#v3.0.0` pins an exact release for maximum determinism.
+- **The plugin ref** — `fjall-tech/fjall-deploy#v4` is a moving major tag, repointed at the latest 4.x release on each plugin republish; `#v4.0.0` pins an exact release for maximum determinism.
 - **`cli-version`** — the `fjall` CLI the plugin installs per run; it defaults to the plugin major's compatible CLI major.
 
 Upgrade majors deliberately: a new plugin major defaults to a new CLI major, so bump the plugin ref and any explicit `cli-version` pin in the same change.

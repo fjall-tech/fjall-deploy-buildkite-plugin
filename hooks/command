@@ -6,7 +6,7 @@ set -euo pipefail
 # minors/patches but never silently crosses into the next. Kept in lockstep with
 # both manifests' `cli-version` default and CI_RUN_INPUT_VOCABULARY's
 # COMPATIBLE_CLI_MAJOR by the ci-plugin parity test.
-FJALL_CLI_DEFAULT_MAJOR="7"
+FJALL_CLI_DEFAULT_MAJOR="14"
 
 # Node runtime the CLI requires. When the agent's node is older than this major
 # (or absent), the hook bootstraps this exact build from nodejs.org, verified
@@ -61,6 +61,24 @@ reject_leading_dash deploy-target "${DEPLOY_TARGET}"
 reject_leading_dash region "${REGION}"
 reject_leading_dash image-tag "${IMAGE_TAG}"
 reject_leading_dash approval-token "${APPROVAL_TOKEN}"
+
+# The same guard per item for the array properties, HERE rather than in the
+# argv-composition loops below: a flag-shaped item must fail before the
+# secret fetch and the Node/CLI install, not after them.
+reject_flag_shaped_items() {
+  local property="$1" env_prefix="$2" i=0 var value
+  while true; do
+    var="${env_prefix}${i}"
+    value="${!var:-}"
+    if [ -z "${value}" ]; then
+      break
+    fi
+    reject_leading_dash "${property}" "${value}"
+    i=$((i + 1))
+  done
+}
+reject_flag_shaped_items build-args BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_
+reject_flag_shaped_items build-secrets BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS_
 
 if [ -z "${TARGET}" ]; then
   echo "^^^ +++"
@@ -276,7 +294,6 @@ else
     if [ -z "${value}" ]; then
       break
     fi
-    reject_leading_dash build-args "${value}"
     ARGS+=(--build-arg "${value}")
     i=$((i + 1))
   done
@@ -288,7 +305,6 @@ else
     if [ -z "${value}" ]; then
       break
     fi
-    reject_leading_dash build-secrets "${value}"
     ARGS+=(--build-secret "${value}")
     i=$((i + 1))
   done
