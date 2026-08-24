@@ -247,7 +247,7 @@ Fjall allows one active deployment per app. A deploy that starts while another i
 
 ### "This deployment requires a newer fjall CLI"
 
-The Fjall API refuses deploys from a CLI older than the app's engine floor. The refusal suggests `npm install -g @fjall/cli@latest` — correct for a workstation, wrong here: the plugin installs the CLI per run from `cli-version`, so upgrading the agent's global CLI changes nothing. Fix it in the pipeline instead:
+The Fjall API refuses deploys from a CLI older than the app's engine floor. The refusal suggests `npm install -g fjall@latest` — correct for a workstation, wrong here: the plugin installs the CLI per run from `cli-version`, so upgrading the agent's global CLI changes nothing. Fix it in the pipeline instead:
 
 - bump `cli-version` to the required major (or a newer exact version), or
 - set `cli-version: auto` to derive the major from the app's pinned `@fjall/components-infrastructure`, or
