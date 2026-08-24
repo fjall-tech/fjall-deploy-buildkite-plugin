@@ -66,7 +66,7 @@ configuration:
         type: string
     cli-version:
       type: string
-      default: "18"
+      default: "19"
     working-directory:
       type: string
       default: "."

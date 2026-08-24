@@ -6,7 +6,7 @@ set -euo pipefail
 # minors/patches but never silently crosses into the next. Kept in lockstep with
 # both manifests' `cli-version` default and CI_RUN_INPUT_VOCABULARY's
 # COMPATIBLE_CLI_MAJOR by the ci-plugin parity test.
-FJALL_CLI_DEFAULT_MAJOR="18"
+FJALL_CLI_DEFAULT_MAJOR="19"
 
 # Node runtime the CLI requires. When the agent's node is older than this major
 # (or absent), the hook bootstraps this exact build from nodejs.org, verified
