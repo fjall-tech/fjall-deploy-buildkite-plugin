@@ -104,7 +104,7 @@ A `plan-pending` result also posts a warning annotation with re-run instructions
 
 ## Serialising Deploys
 
-Fjall allows one active deployment per app (the deploy slot). Give every deploy step for the same app a shared concurrency group — the same shape `fjall ci setup` scaffolds — so overlapping builds queue instead of contending for the slot:
+Fjall allows one active deployment per organisation (the deploy slot). Give every deploy step for the same app a shared concurrency group — the same shape `fjall ci setup` scaffolds — so overlapping builds queue instead of contending for the slot:
 
 ```yaml
 steps:
@@ -243,7 +243,7 @@ Upgrade majors deliberately: a new plugin major defaults to a new CLI major, so 
 
 > Blocked: Jane has been deploying my-app from CI since 03/08/2026, 14:02:11 (deployment cmd0a1b2c…). View progress in the Fjall dashboard: …
 
-Fjall allows one active deployment per app. A deploy that starts while another is in flight is refused with the message above — wait for the active deployment to finish (or cancel it from the dashboard), then retry. `fjall deployments list` shows your organisation's active deployments. Prevent the contention with a concurrency group ([Serialising Deploys](#serialising-deploys)).
+Fjall allows one active deployment per organisation. An application deploy or destroy that starts while another deployment is in flight first queues behind it: the step re-claims the slot every 30 seconds for up to 20 minutes, logging who holds it, and only then fails with the message above. Tier targets (`organisation`, `platform`, `account`) route to the noun-verb commands and are not queued: they fail immediately on a held slot. Wait for the active deployment to finish (or cancel it from the dashboard), then retry. `fjall deployments list` shows your organisation's active deployments. Prevent the contention with a concurrency group ([Serialising Deploys](#serialising-deploys)).
 
 ### "This deployment requires a newer fjall CLI"
 
