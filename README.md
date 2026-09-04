@@ -203,7 +203,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v21.0.0:
           target: my-app
-          cli-version: "7.0.0"
+          cli-version: "31.0.0"
 ```
 
 ### Staging to Production Pipeline
