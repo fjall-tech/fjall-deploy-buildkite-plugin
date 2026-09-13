@@ -107,16 +107,6 @@ teardown() {
   assert_output --partial "--skip-build"
 }
 
-@test "Deploys with skip-migrations flag" {
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SKIP_MIGRATIONS="true"
-
-  run "$PWD/hooks/command"
-
-  assert_success
-  assert_output --partial "--skip-migrations"
-}
-
 # T3: the tier words are noun-verb. A tier target routes to `fjall <noun>
 # <verb>` — the app-only `ci run <cmd> <target>` surface rejects them — and
 # only the flags a tier leaf honours (force, verbose, organisation-only

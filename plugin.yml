@@ -35,9 +35,6 @@ configuration:
     skip-build:
       type: boolean
       default: false
-    skip-migrations:
-      type: boolean
-      default: false
     no-cascade:
       type: boolean
       default: false

@@ -26,7 +26,6 @@ ENVIRONMENT="${BUILDKITE_PLUGIN_FJALL_DEPLOY_ENVIRONMENT:-}"
 DEPLOY_TARGET="${BUILDKITE_PLUGIN_FJALL_DEPLOY_DEPLOY_TARGET:-}"
 VERBOSE="${BUILDKITE_PLUGIN_FJALL_DEPLOY_VERBOSE:-false}"
 SKIP_BUILD="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SKIP_BUILD:-false}"
-SKIP_MIGRATIONS="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SKIP_MIGRATIONS:-false}"
 NO_CASCADE="${BUILDKITE_PLUGIN_FJALL_DEPLOY_NO_CASCADE:-false}"
 REGION="${BUILDKITE_PLUGIN_FJALL_DEPLOY_REGION:-}"
 IMAGE_TAG="${BUILDKITE_PLUGIN_FJALL_DEPLOY_IMAGE_TAG:-}"
@@ -191,7 +190,6 @@ if [ -n "${TIER_NOUN}" ]; then
   if [ -n "${ENVIRONMENT}" ]; then INCOMPATIBLE+=("environment"); fi
   if [ -n "${DEPLOY_TARGET}" ]; then INCOMPATIBLE+=("deploy-target"); fi
   if [ "${SKIP_BUILD}" = "true" ]; then INCOMPATIBLE+=("skip-build"); fi
-  if [ "${SKIP_MIGRATIONS}" = "true" ]; then INCOMPATIBLE+=("skip-migrations"); fi
   if [ -n "${REGION}" ]; then INCOMPATIBLE+=("region"); fi
   if [ -n "${IMAGE_TAG}" ]; then INCOMPATIBLE+=("image-tag"); fi
   if [ "${PLAN}" = "true" ]; then INCOMPATIBLE+=("plan"); fi
@@ -256,10 +254,6 @@ else
 
   if [ "${SKIP_BUILD}" = "true" ]; then
     ARGS+=(--skip-build)
-  fi
-
-  if [ "${SKIP_MIGRATIONS}" = "true" ]; then
-    ARGS+=(--skip-migrations)
   fi
 
   if [ -n "${REGION}" ]; then
