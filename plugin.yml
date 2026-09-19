@@ -63,7 +63,7 @@ configuration:
         type: string
     cli-version:
       type: string
-      default: "38"
+      default: "39"
     working-directory:
       type: string
       default: "."
