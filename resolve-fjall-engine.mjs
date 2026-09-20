@@ -17,8 +17,15 @@
  * published artifacts (this ships inside the action; that lives in the app
  * repo) so they are structurally identical by design, not a shared module.
  */
-import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import {
+  readFileSync,
+  existsSync,
+  readdirSync,
+  statSync,
+  realpathSync,
+} from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const CONSTRUCT_PACKAGE = "@fjall/components-infrastructure";
 
@@ -121,8 +128,31 @@ function main() {
   console.log(resolveEngineSpec(workDir));
 }
 
-const invokedPath = process.argv[1] ?? "";
-if (import.meta.url.endsWith(invokedPath.replace(/\\/g, "/"))) {
+/**
+ * True only when node was invoked with THIS file. Compares realpaths: node
+ * canonicalises the entry module through symlinks, so `import.meta.url`
+ * arrives resolved while `process.argv[1]` is whatever the caller typed. The
+ * suffix match this replaced answered false for a symlinked or
+ * relatively-spelled invocation, and the script then exited 0 having printed
+ * no engine spec at all — the hook reads that empty answer as the spec.
+ *
+ * This repeats `scripts/lib/invokedDirectly.mjs` on purpose: the plugin ships
+ * standalone to customers' CI, with no node_modules and no repository around
+ * it, so it cannot import the helper.
+ */
+function isInvokedDirectly() {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return (
+      realpathSync(process.argv[1]) ===
+      realpathSync(fileURLToPath(import.meta.url))
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isInvokedDirectly()) {
   try {
     main();
   } catch (err) {

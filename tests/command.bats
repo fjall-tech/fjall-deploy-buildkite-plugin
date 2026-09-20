@@ -1,5 +1,23 @@
 #!/usr/bin/env bats
 
+# The hook's pins are READ here, never restated. A literal copy in this file
+# rots silently — a hardcoded CLI major survived two majors before this suite
+# first ran in CI — and the Node pins rot worse than the major did: a raised
+# NODE_FLOOR turns the "compatible agent" stub below into a below-floor one,
+# so every default-path test starts down the bootstrap branch it was written
+# to skip. An unreadable pin is a failure, not a default: an empty value would
+# stub `v` as the agent's version and every assertion after it would be
+# vacuous.
+read_hook_pin() {
+  local value
+  value="$(sed -n "s/^$1=\"\([^\"]*\)\"\$/\1/p" "$PWD/hooks/command")"
+  [ -n "$value" ] || {
+    echo "could not read $1 from hooks/command" >&2
+    return 1
+  }
+  printf '%s' "$value"
+}
+
 setup() {
   load "$BATS_PLUGIN_PATH/load.bash"
 
@@ -8,22 +26,28 @@ setup() {
   # `buildkite-agent secret get`. The dedicated secret-fetch test unsets it.
   export FJALL_API_KEY="fjall_dk_bats"
 
-  # The hook bootstraps Node only when the agent's node is older than the CLI's
-  # required major; report a compatible node so the default path skips the
-  # curl/verify/extract bootstrap. The Node-bootstrap tests drain-and-replace
-  # this with an old-node stub.
-  stub node "--version : echo 'v22.14.0'"
+  # The hook bootstraps Node only when the agent's node is below NODE_FLOOR;
+  # report a compatible node so the default path skips the curl/verify/extract
+  # bootstrap. The Node-bootstrap tests drain-and-replace this with a
+  # below-floor stub.
+  #
+  # The version reported is the one the hook itself installs, which the
+  # ci-plugin parity test proves clears NODE_FLOOR — so "compatible" here is a
+  # fact about the hook rather than a second literal to keep in step with it.
+  # Plain assignments, deliberately: `export X="$(cmd)"` and `local X="$(cmd)"`
+  # take the BUILTIN's exit status, so the reader's refusal would be swallowed
+  # and setup would carry on with an empty pin. setup() and the test body share
+  # a shell, so there is nothing to export for.
+  HOOK_NODE_VERSION="$(read_hook_pin NODE_VERSION)"
+  HOOK_NODE_FLOOR="$(read_hook_pin NODE_FLOOR)"
+  stub node "--version : echo 'v${HOOK_NODE_VERSION}'"
 
   # Create a stub for npm. With no cli-version set, the hook defaults to
   # FJALL_CLI_DEFAULT_MAJOR (design § 5.2 version tie), so the default install
   # is `fjall@<that major>`, not bare `fjall`. Derived from the hook rather
   # than restated: a hardcoded major here silently rotted across two CLI
   # majors before this suite first ran in CI.
-  FJALL_CLI_DEFAULT_MAJOR="$(sed -n 's/^FJALL_CLI_DEFAULT_MAJOR="\([0-9][0-9]*\)"$/\1/p' "$PWD/hooks/command")"
-  [ -n "$FJALL_CLI_DEFAULT_MAJOR" ] || {
-    echo "could not read FJALL_CLI_DEFAULT_MAJOR from hooks/command" >&2
-    return 1
-  }
+  FJALL_CLI_DEFAULT_MAJOR="$(read_hook_pin FJALL_CLI_DEFAULT_MAJOR)"
   stub npm "install -g fjall@${FJALL_CLI_DEFAULT_MAJOR} : echo 'installed fjall@${FJALL_CLI_DEFAULT_MAJOR}'"
 
   # Create a stub for fjall. The second plan line uses the `::` unconditional
@@ -297,7 +321,7 @@ teardown() {
   node --version > /dev/null
   unstub node
   stub node \
-    "--version : echo 'v22.14.0'" \
+    "--version : echo 'v${HOOK_NODE_VERSION}'" \
     ":: echo 'fjall@7'"
 
   # setup()'s npm plan expects the baked default major; the resolver echoed 7,
@@ -325,7 +349,7 @@ teardown() {
   node --version > /dev/null
   unstub node
   stub node \
-    "--version : echo 'v22.14.0'" \
+    "--version : echo 'v${HOOK_NODE_VERSION}'" \
     ":: exit 1"
 
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
@@ -335,6 +359,32 @@ teardown() {
 
   assert_failure
   assert_output --partial "Failed to resolve the fjall engine"
+  refute_output --partial "ci run"
+}
+
+# The other half of the same contract, and the one an exit-status check cannot
+# see: the resolver exits 0 and prints NOTHING. Its own entry guard returns
+# false when it cannot realpath the entry module, and a script that decides it
+# was not the entry exits 0 having printed no spec — so a success status is not
+# an answer. Without the emptiness refusal the hook reaches
+# `npm install -g ""`, which is an install nobody chose on the one lane whose
+# purpose is choosing. setup()'s npm plan is left in place deliberately: if the
+# hook proceeded, npm would be called off-plan and the test would red anyway,
+# so this asserts the refusal rather than merely the absence of the install.
+@test "cli-version auto fails the step when the engine resolver names no engine" {
+  node --version > /dev/null
+  unstub node
+  stub node \
+    "--version : echo 'v${HOOK_NODE_VERSION}'" \
+    ":: exit 0"
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_CLI_VERSION="auto"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "exited 0 without naming an engine"
   refute_output --partial "ci run"
 }
 
@@ -520,9 +570,9 @@ teardown() {
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
 }
 
-# L3 (design § 5.2) — when the agent's node is older than the CLI's required
-# major the hook bootstraps a pinned build, verified against its SHA-256 before
-# extraction, and prepends it to PATH.
+# L3 (design § 5.2) — when the agent's node is below NODE_FLOOR the hook
+# bootstraps a pinned build, verified against its SHA-256 before extraction,
+# and prepends it to PATH.
 @test "bootstraps a pinned, SHA-verified Node when the agent node is too old" {
   # Drain setup()'s compatible-node plan, then replace with an old node so the
   # bootstrap path fires (mirrors the fjall drain-then-replace idiom above).
@@ -543,8 +593,62 @@ teardown() {
   unstub sha256sum
   unstub tar
   assert_success
-  assert_output --partial "Bootstrapping Node 24.18.1"
+  assert_output --partial "Bootstrapping Node ${HOOK_NODE_VERSION}"
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+# The floor is a full version, not a major. 22.3.0 is a Node 22 — it passed the
+# hook's old `-lt 22` major test — and the published `fjall` package refuses it,
+# so the agent must be bootstrapped rather than left to fail at `npm install`.
+@test "bootstraps for a Node 22 agent below the full-version floor" {
+  node --version > /dev/null
+  unstub node
+  stub node "--version : echo 'v22.3.0'"
+  stub uname "-m : echo 'x86_64'"
+  stub curl "-fsSL -o * * : true"
+  stub sha256sum "-c - : true"
+  stub tar "-xJf * -C * : true"
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub curl
+  unstub sha256sum
+  unstub tar
+  assert_success
+  assert_output --partial "Bootstrapping Node ${HOOK_NODE_VERSION}"
+  assert_output --partial "agent node: 22.3.0"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+# The other direction: an agent exactly AT the floor is compatible and is not
+# sent through a 50 MB download. The curl plan is a tripwire — a gate that
+# bootstraps here aborts on it rather than reaching the network.
+@test "does not bootstrap when the agent node is exactly at the floor" {
+  node --version > /dev/null
+  unstub node
+  stub node "--version : echo 'v${HOOK_NODE_FLOOR}'"
+  stub curl "-fsSL -o * * : exit 1"
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  assert_success
+  refute_output --partial "Bootstrapping Node"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+# The derivation above is only worth having if it fails loudly. A pin this
+# suite cannot find must stop the run: the silent alternative is an empty
+# version stubbed as `v`, which the hook reads as below any floor, so every
+# default-path test would take the bootstrap branch and the assertions that
+# passed would be about a path nobody meant to exercise.
+@test "a hook pin this suite cannot read fails rather than stubbing an empty version" {
+  run read_hook_pin NOT_A_REAL_PIN
+  assert_failure
+  assert_output --partial "could not read NOT_A_REAL_PIN"
 }
 
 # The SHA-256 check is a gate, not a log line: a digest mismatch aborts under
@@ -570,7 +674,7 @@ teardown() {
   unstub curl
   unstub sha256sum
   assert_failure
-  assert_output --partial "Bootstrapping Node 24.18.1"
+  assert_output --partial "Bootstrapping Node ${HOOK_NODE_VERSION}"
   refute_output --partial "EXTRACTED"
   refute_output --partial "ci run"
 }

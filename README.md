@@ -265,7 +265,7 @@ Any deploy or build that produces a container image runs Docker on the agent. In
 
 ## Requirements
 
-- Node.js >= 22 — if the agent's node is older (or absent), the plugin bootstraps a pinned Node build from nodejs.org, SHA-256-verified before use (a Linux agent with `curl` and `tar` is required for the bootstrap path)
+- Node.js >= 22.12.0 — if the agent's node is below that floor (or absent), the plugin bootstraps a pinned Node build from nodejs.org, SHA-256-verified before use (a Linux agent with `curl` and `tar` is required for the bootstrap path)
 - npm
 - Docker — required for any deploy or build that produces a container image (`image-tag` / `skip-build` deploys excepted)
 - AWS credentials available in the environment

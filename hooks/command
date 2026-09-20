@@ -8,11 +8,17 @@ set -euo pipefail
 # COMPATIBLE_CLI_MAJOR by the ci-plugin parity test.
 FJALL_CLI_DEFAULT_MAJOR="39"
 
-# Node runtime the CLI requires. When the agent's node is older than this major
-# (or absent), the hook bootstraps this exact build from nodejs.org, verified
-# against a pinned SHA-256 before use — a tampered or truncated tarball aborts
-# the run rather than executing. Bump the version and BOTH per-arch digests
-# together from https://nodejs.org/dist/v<version>/SHASUMS256.txt.
+# The `fjall` wrapper's declared `engines.node`. When the agent's node is below
+# this floor (or absent), the hook bootstraps NODE_VERSION from nodejs.org.
+# The floor is a full version, not a major: 22.3.0 is a Node 22 the published
+# package refuses. Kept in lockstep with wrappers/fjall/package.json's
+# `engines.node` by the ci-plugin parity test.
+NODE_FLOOR="22.12.0"
+
+# The Node build the hook installs when it bootstraps, verified against a
+# pinned SHA-256 before use — a tampered or truncated tarball aborts the run
+# rather than executing. Bump the version and BOTH per-arch digests together
+# from https://nodejs.org/dist/v<version>/SHASUMS256.txt.
 NODE_VERSION="24.18.1"
 NODE_SHA256_X64="d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0"
 NODE_SHA256_ARM64="7201e3a09dc825bac57867c81913e2b8f0ef87d04cb9082af4cda82f6ff3d88c"
@@ -96,25 +102,32 @@ if [ -z "${FJALL_API_KEY:-}" ]; then
   fi
 fi
 
-# Bootstrap Node when the agent's runtime is older than the CLI requires (or
+# Bootstrap Node when the agent's runtime is below the wrapper's floor (or
 # absent). Fetch the pinned build, verify its SHA-256 before extracting, and
 # prepend it to PATH so `npm`/`fjall` resolve to it. A digest mismatch aborts
 # under `set -e` rather than executing an unverified binary.
-NODE_MAJOR=0
+NODE_AGENT_VERSION="0.0.0"
 if command -v node > /dev/null 2>&1; then
-  NODE_VERSION_RAW="$(node --version 2>/dev/null || echo v0)"
-  NODE_VERSION_RAW="${NODE_VERSION_RAW#v}"
-  NODE_MAJOR="${NODE_VERSION_RAW%%.*}"
+  NODE_AGENT_VERSION="$(node --version 2>/dev/null || echo v0.0.0)"
+  NODE_AGENT_VERSION="${NODE_AGENT_VERSION#v}"
 fi
-NODE_MAJOR="${NODE_MAJOR:-0}"
-if [ "${NODE_MAJOR}" -lt 22 ]; then
-  echo "--- :node: Bootstrapping Node ${NODE_VERSION} (agent node major: ${NODE_MAJOR})"
+NODE_AGENT_VERSION="${NODE_AGENT_VERSION:-0.0.0}"
+# Compare the FULL version, not the major: an agent on 22.3.0 passes a
+# `-lt 22` test and still cannot run the CLI. `sort -V` orders versions and is
+# present on GNU coreutils, macOS and busybox; the lower of the pair is the
+# agent's exactly when the agent is below the floor. The first line is taken by
+# expansion rather than `| head -n 1`: head exits on the first line, and the
+# SIGPIPE that lands on sort fails the whole substitution under `pipefail`.
+NODE_SORTED="$(printf '%s\n%s\n' "${NODE_AGENT_VERSION}" "${NODE_FLOOR}" | sort -V)"
+NODE_LOWEST="${NODE_SORTED%%$'\n'*}"
+if [ "${NODE_AGENT_VERSION}" != "${NODE_FLOOR}" ] && [ "${NODE_LOWEST}" = "${NODE_AGENT_VERSION}" ]; then
+  echo "--- :node: Bootstrapping Node ${NODE_VERSION} (agent node: ${NODE_AGENT_VERSION}, floor: ${NODE_FLOOR})"
   case "$(uname -m)" in
     x86_64 | amd64) NODE_ARCH="x64"; NODE_SHA256="${NODE_SHA256_X64}" ;;
     aarch64 | arm64) NODE_ARCH="arm64"; NODE_SHA256="${NODE_SHA256_ARM64}" ;;
     *)
       echo "^^^ +++"
-      echo "Error: unsupported architecture '$(uname -m)' for Node bootstrap; install Node >= 22 on the agent."
+      echo "Error: unsupported architecture '$(uname -m)' for Node bootstrap; install Node >= ${NODE_FLOOR} on the agent."
       exit 1
       ;;
   esac
@@ -149,6 +162,14 @@ elif [ "${CLI_VERSION}" = "auto" ]; then
   PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
   if ! RESOLVED_ENGINE_SPEC="$(node "${PLUGIN_DIR}/resolve-fjall-engine.mjs" "${WORKING_DIR}")"; then
     echo "Failed to resolve the fjall engine from the app's @fjall/components-infrastructure pin" >&2
+    exit 1
+  fi
+  # An exit status is not an answer. The resolver prints one line and exits 0;
+  # a status-only check reads a silent success as a spec and hands the empty
+  # string to npm, which installs something nobody chose on the lane whose
+  # whole purpose is to pick the right major. Emptiness is its own refusal.
+  if [ -z "${RESOLVED_ENGINE_SPEC}" ]; then
+    echo "The fjall engine resolver exited 0 without naming an engine — refusing to install an unnamed one" >&2
     exit 1
   fi
   npm install -g "${RESOLVED_ENGINE_SPEC}"
