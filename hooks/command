@@ -121,6 +121,15 @@ NODE_AGENT_VERSION="${NODE_AGENT_VERSION:-0.0.0}"
 NODE_SORTED="$(printf '%s\n%s\n' "${NODE_AGENT_VERSION}" "${NODE_FLOOR}" | sort -V)"
 NODE_LOWEST="${NODE_SORTED%%$'\n'*}"
 if [ "${NODE_AGENT_VERSION}" != "${NODE_FLOOR}" ] && [ "${NODE_LOWEST}" = "${NODE_AGENT_VERSION}" ]; then
+  # The pinned builds are Linux tarballs, and `uname -m` spells arm64 the same
+  # on macOS: without this, a macOS agent would put a Linux ELF first on PATH
+  # and die at `npm install` with an exec-format error that names nothing.
+  NODE_OS="$(uname -s)"
+  if [ "${NODE_OS}" != "Linux" ]; then
+    echo "^^^ +++"
+    echo "Error: agent node ${NODE_AGENT_VERSION} is below ${NODE_FLOOR}, and the Node bootstrap installs Linux builds only (this agent runs ${NODE_OS}); install Node >= ${NODE_FLOOR} on the agent."
+    exit 1
+  fi
   echo "--- :node: Bootstrapping Node ${NODE_VERSION} (agent node: ${NODE_AGENT_VERSION}, floor: ${NODE_FLOOR})"
   case "$(uname -m)" in
     x86_64 | amd64) NODE_ARCH="x64"; NODE_SHA256="${NODE_SHA256_X64}" ;;

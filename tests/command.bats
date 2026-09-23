@@ -579,7 +579,7 @@ teardown() {
   node --version > /dev/null
   unstub node
   stub node "--version : echo 'v18.20.5'"
-  stub uname "-m : echo 'x86_64'"
+  stub uname "-s : echo 'Linux'" "-m : echo 'x86_64'"
   stub curl "-fsSL -o * * : true"
   stub sha256sum "-c - : true"
   stub tar "-xJf * -C * : true"
@@ -604,7 +604,7 @@ teardown() {
   node --version > /dev/null
   unstub node
   stub node "--version : echo 'v22.3.0'"
-  stub uname "-m : echo 'x86_64'"
+  stub uname "-s : echo 'Linux'" "-m : echo 'x86_64'"
   stub curl "-fsSL -o * * : true"
   stub sha256sum "-c - : true"
   stub tar "-xJf * -C * : true"
@@ -640,6 +640,29 @@ teardown() {
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
 }
 
+# The pinned builds are Linux tarballs. A below-floor agent on any other OS is
+# refused with the floor named, before anything is downloaded — `uname -m`
+# reads arm64 on Apple Silicon too, so without the OS gate a macOS agent would
+# be handed a Linux binary. The curl plan is a tripwire.
+@test "a below-floor agent that is not Linux is refused before any download" {
+  node --version > /dev/null
+  unstub node
+  stub node "--version : echo 'v22.3.0'"
+  stub uname "-s : echo 'Darwin'"
+  stub curl "-fsSL -o * * : exit 1"
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub uname
+  assert_failure
+  assert_output --partial "agent node 22.3.0 is below ${HOOK_NODE_FLOOR}"
+  assert_output --partial "this agent runs Darwin"
+  refute_output --partial "Bootstrapping Node"
+  refute_output --partial "ci run"
+}
+
 # The derivation above is only worth having if it fails loudly. A pin this
 # suite cannot find must stop the run: the silent alternative is an empty
 # version stubbed as `v`, which the hook reads as below any floor, so every
@@ -657,7 +680,7 @@ teardown() {
   node --version > /dev/null
   unstub node
   stub node "--version : echo 'v18.20.5'"
-  stub uname "-m : echo 'x86_64'"
+  stub uname "-s : echo 'Linux'" "-m : echo 'x86_64'"
   stub curl "-fsSL -o * * : true"
   stub sha256sum "-c - : exit 1"
   # Make extraction observable. A correct gate aborts under set -e before `tar`
