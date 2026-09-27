@@ -13,9 +13,9 @@
  * pins disagree — guessing an engine major is exactly the silent-skew failure
  * this closes. See aiDocs decisions/2026-07-25-deploy-engine-runtime-version-contract.md.
  *
- * Sibling of webapp/scripts/resolve-fjall-engine.mjs — the two are independently
- * published artifacts (this ships inside the action; that lives in the app
- * repo) so they are structurally identical by design, not a shared module.
+ * Byte-identical to the copy the other CI plugin ships: each plugin is published
+ * on its own, so each carries the resolver rather than importing a shared
+ * module. engineResolver.test.ts in @fjall/cli pins the two equal.
  */
 import {
   readFileSync,
