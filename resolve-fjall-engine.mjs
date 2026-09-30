@@ -129,16 +129,29 @@ function main() {
 }
 
 /**
- * True only when node was invoked with THIS file. Compares realpaths: node
+ * True only when node was started on THIS file. Compares realpaths: node
  * canonicalises the entry module through symlinks, so `import.meta.url`
- * arrives resolved while `process.argv[1]` is whatever the caller typed. The
- * suffix match this replaced answered false for a symlinked or
- * relatively-spelled invocation, and the script then exited 0 having printed
- * no engine spec at all — the hook reads that empty answer as the spec.
+ * arrives resolved while `process.argv[1]` is the caller's spelling made
+ * absolute, with symlinks kept. The suffix match this replaced answered false
+ * for a start through a symlinked file or directory, unless the path node was
+ * given happened to end the real one (as `/tmp/…` ends `/private/tmp/…` on
+ * macOS). When it answered false, the script exited 0 having printed no
+ * engine spec at all.
  *
- * This repeats `scripts/lib/invokedDirectly.mjs` on purpose: the plugin ships
- * standalone to customers' CI, with no node_modules and no repository around
- * it, so it cannot import the helper.
+ * This keeps a subset of the fjall repository's
+ * `scripts/started-on-this-file.mjs` on purpose: the plugin ships standalone
+ * to customers' CI, with no node_modules and no repository around it, so it
+ * cannot import that helper. Both compare realpaths, so a start through a
+ * symlinked file or directory reads as started. The helper also resolves
+ * `argv[1]` first, which completes a start without the extension or by a
+ * directory. Node never completes an `.mjs` extension, and reaches an `.mjs`
+ * file by a directory only through that directory's package.json `main`,
+ * which neither plugin ships, so this file does not need that. What else
+ * differs is failure: this reads any failure to realpath either path as "not
+ * started", where the helper says "not started" only when `argv[1]` names no
+ * module and rethrows anything else. Each plugin starts this file by its full
+ * path and refuses an answer that names no engine, so that reading cannot
+ * install an unnamed one.
  */
 function isInvokedDirectly() {
   if (process.argv[1] === undefined) return false;
