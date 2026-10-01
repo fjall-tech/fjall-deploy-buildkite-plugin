@@ -14,19 +14,71 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v29.0.0:
           target: my-app
+          deploy-target: production-use1
 ```
 
 ## Authentication
 
+Two credentials are involved: a Fjall deploy token (`FJALL_API_KEY`) and AWS credentials.
+
+### Fjall API Key
+
 The CLI authenticates to Fjall via `FJALL_API_KEY` — an app-scoped `fjall_dk_` deploy token. Deploy tokens are minted from a signed-in browser session by an owner or admin (**Settings → CI/CD Tokens** in the [Fjall dashboard](https://fjall.io)); the CLI carries no mint path — `fjall ci setup` writes the workflow and prints the URL to mint at. Tokens expire after at most 90 days — re-mint from the same page and update the secret to rotate. Store the token as a [Buildkite secret](https://buildkite.com/docs/pipelines/security/secrets) named `FJALL_API_KEY`. If the environment does not already export `FJALL_API_KEY`, the plugin fetches it from the secret store via `buildkite-agent secret get FJALL_API_KEY`, so you need only store the secret — no `env:` wiring required. Exporting it as an environment variable still works and takes precedence.
 
-AWS credentials must also be available in the build environment before the plugin runs. Common approaches:
+### AWS Credentials
 
-### IAM Instance Profile
+When `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are both set in the step's
+environment, the CLI uses them and never reaches the Fjall mint, and
+`deploy-target` is resolved against whatever those keys point at rather than
+the target's own account. Otherwise the CLI mints a session from your deploy
+token. Pick one path: an agent or pipeline that exports AWS keys for other
+steps should not export them to the deploy step unless they are the
+credentials the deploy should use.
 
-Buildkite agents running on EC2 can use an instance profile with the necessary permissions. No extra configuration needed.
+#### Option 1: Fjall OIDC (recommended — no AWS setup)
 
-### Environment Variables
+Store `FJALL_API_KEY` and export no AWS credentials. The CLI exchanges your
+deploy token with the Fjall API for a short-lived, Fjall-signed web-identity
+token, then calls `sts:AssumeRoleWithWebIdentity` against the
+`FjallDeploy<orgId>` role that `fjall connect` created in your account. The
+deploy token _is_ the pipeline's AWS credential.
+
+You need no IAM OIDC provider of your own, no deploy role and no AWS secrets.
+An agent's EC2 instance profile plays no part either: the CLI does not read
+it, so an agent on EC2 deploys this way like any other.
+
+```yaml
+steps:
+  - label: ":rocket: Deploy"
+    plugins:
+      - fjall-tech/fjall-deploy#v29.0.0:
+          target: my-app
+          deploy-target: production-use1
+```
+
+Every CI deploy token carries the `deploy:oidc:mint` scope in its base set, so
+there is nothing extra to grant.
+
+#### Option 2: AWS OIDC with Assume Role
+
+Use the [aws-assume-role-with-web-identity](https://github.com/buildkite-plugins/aws-assume-role-with-web-identity-buildkite-plugin) plugin to assume a role you create and maintain. It puts the role session's keys in the step's environment, so the Fjall mint is not used:
+
+```yaml
+steps:
+  - label: ":rocket: Deploy"
+    plugins:
+      - aws-assume-role-with-web-identity#v1.0.0:
+          role-arn: arn:aws:iam::123456789012:role/deploy
+      - fjall-tech/fjall-deploy#v29.0.0:
+          target: my-app
+          deploy-target: production-use1
+```
+
+The CLI cannot renew a session it reads from the environment, so a deploy that
+runs longer than the role session (one that upgrades database engines, for
+example) fails when the session expires.
+
+#### Option 3: Environment Variables
 
 Set credentials in your Buildkite agent environment or pipeline settings:
 
@@ -40,21 +92,13 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v29.0.0:
           target: my-app
+          deploy-target: production-use1
 ```
 
-### AWS OIDC with Assume Role
-
-Use the [aws-assume-role-with-web-identity](https://github.com/buildkite-plugins/aws-assume-role-with-web-identity-buildkite-plugin) plugin:
-
-```yaml
-steps:
-  - label: ":rocket: Deploy"
-    plugins:
-      - aws-assume-role-with-web-identity#v1.0.0:
-          role-arn: arn:aws:iam::123456789012:role/deploy
-      - fjall-tech/fjall-deploy#v29.0.0:
-          target: my-app
-```
+The CLI cannot renew keys it reads from the environment, so when these are
+temporary session keys (they come with `AWS_SESSION_TOKEN`), a deploy that
+runs longer than their session (one that upgrades database engines, for
+example) fails when they expire.
 
 ## Configuration
 
@@ -268,7 +312,7 @@ Any deploy or build that produces a container image runs Docker on the agent. In
 - Node.js >= 22.12.0 — if the agent's node is below that floor (or absent), the plugin bootstraps a pinned Node build from nodejs.org, SHA-256-verified before use (a Linux agent with `curl` and `tar` is required for the bootstrap path)
 - npm
 - Docker — required for any deploy or build that produces a container image (`image-tag` / `skip-build` deploys excepted)
-- AWS credentials available in the environment
+- A Fjall deploy token (`FJALL_API_KEY`), which is also the deploy's AWS credential unless the step's environment carries AWS keys — see [Authentication](#authentication)
 
 ## Running Tests
 
