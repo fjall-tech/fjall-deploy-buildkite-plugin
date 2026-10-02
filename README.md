@@ -47,6 +47,11 @@ You need no IAM OIDC provider of your own, no deploy role and no AWS secrets.
 An agent's EC2 instance profile plays no part either: the CLI does not read
 it, so an agent on EC2 deploys this way like any other.
 
+The session this path mints lasts one hour. From fjall 40, the CLI renews it
+through the deploy token before it expires, so a deploy can run past the hour.
+Fjall 39 and earlier renew no session on any path, so with them a deploy that
+runs longer than an hour fails part-way on this path too.
+
 ```yaml
 steps:
   - label: ":rocket: Deploy"
