@@ -17,6 +17,8 @@ steps:
           deploy-target: production-use1
 ```
 
+If the deploy step sets `timeout_in_minutes`, or your pipeline sets a default timeout, make it at least 610, the timeout `fjall ci setup` writes: from fjall 40, a deploy waits out each database engine upgrade, which AWS has held for up to three hours, and that covers two upgrades of the slowest engine with their stacks' deploys. A pipeline's or organisation's Maximum Command Step Timeout lowers a longer step timeout to itself. When a plan's upgrades could wait longer than the step's timeout (`BUILDKITE_TIMEOUT`), the plan warns before anything is upgraded (`database-engine-ci-job-limit`). A job stopped mid-upgrade leaves the upgrade running in RDS, and re-running the deploy waits for it and resumes.
+
 ## Authentication
 
 Two credentials are involved: a Fjall deploy token (`FJALL_API_KEY`) and AWS credentials.
