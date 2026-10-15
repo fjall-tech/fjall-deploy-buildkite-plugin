@@ -19,6 +19,10 @@ steps:
 
 If the deploy step sets `timeout_in_minutes`, or your pipeline sets a default timeout, make it at least 650, the timeout `fjall ci setup` writes: from fjall 40, a deploy waits out each database engine upgrade, which AWS has held for up to three hours, and that covers two upgrades of the slowest engine with their stacks' deploys. A pipeline's or organisation's Maximum Command Step Timeout lowers a longer step timeout to itself. When a plan's upgrades could wait longer than the step's timeout (`BUILDKITE_TIMEOUT`), the plan warns before anything is upgraded (`database-engine-ci-job-limit`). A job stopped mid-upgrade leaves the upgrade running in RDS, and re-running the deploy waits for it and resumes.
 
+## Agent Architecture
+
+Fjall builds ECS images for `linux/arm64`, the platform its tasks run on, so run the deploy step on an arm64 agent queue: a Linux ARM queue on Buildkite-hosted agents, or Graviton instances on self-hosted ones. `fjall ci setup --provider buildkite --queue <name>` writes the queue into the step. An x86 agent builds the image only under emulation: without an emulator registered on the agent a `RUN` step fails with an exec format error, and with one the build typically runs several times slower.
+
 ## Authentication
 
 Two credentials are involved: a Fjall deploy token (`FJALL_API_KEY`) and AWS credentials.
@@ -277,6 +281,30 @@ steps:
           environment: production
           skip-build: true
 ```
+
+## Caching the CLI Install
+
+The hook installs `cli-version` with `npm install -g` on every run. npm's cache spares the download, and it also decides what is installed: npm checks a package against the integrity its metadata names, reads that metadata from the same cache, and serves a cached copy without asking the registry while the copy's headers call it fresh. Measured on npm 11.17.0 (2026-10-15), metadata and a tarball planted in npm's cache made `npm install -g` install a version the registry never published and run its install script, which in this hook runs with `FJALL_API_KEY` exported. `--prefer-online` did not stop it: npm asked the registry, which answered the ETags the planted entries carried with 304 Not Modified, and npm kept the planted copies. Whoever can write the cache chooses the CLI your deploy runs, so share it only with builds you would trust to deploy:
+
+- **Self-hosted agents** keep npm's default cache (`~/.npm`) between jobs, so a repeat install of the same version fetches no package again. Every pipeline on the agent shares that cache: an agent that runs untrusted builds should not run deploys, the same rule as for cluster secrets.
+- **Buildkite-hosted agents** start each job with an empty home directory, so persist npm's cache with a cache volume. A volume is shared by every build of the pipeline, whatever its branch, and an unnamed volume is the pipeline's default, which every step that declares a cache without a name mounts (Buildkite's [cache volumes](https://buildkite.com/docs/agent/buildkite-hosted/cache-volumes) docs, read 2026-10-15). Mount one only on a deploy pipeline that builds `main` alone with pull-request builds off, as the header of the pipeline `fjall ci setup` writes requires, give it a name of its own, and mount it in the deploy step alone:
+
+```yaml
+steps:
+  - label: ":rocket: Deploy"
+    cache:
+      name: fjall-deploy-npm
+      paths:
+        - "/var/cache/fjall-deploy-npm"
+    env:
+      NPM_CONFIG_CACHE: "/var/cache/fjall-deploy-npm"
+    plugins:
+      - fjall-tech/fjall-deploy#v29.0.0:
+          target: my-app
+          deploy-target: production-use1
+```
+
+Keep the path absolute and outside the checkout. A service with no `docker.context` builds from its Dockerfile's directory, which for a Dockerfile at the repository root is the whole checkout, and npm writes a new debug log into its cache on every run: a cache inside the checkout would go into every build's context and change it each time, so a `COPY . .` layer and every layer after it would rebuild on every deploy. Cache volumes are best-effort: a job that gets an empty one downloads as before.
 
 ## Versioning
 
