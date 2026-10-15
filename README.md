@@ -136,6 +136,8 @@ example) fails when they expire.
 | `working-directory` | no       | `.`      | Directory containing `fjall-config.json`                                                                                                                                                                                                                                                            |
 | `force`             | no       | `false`  | Deploy: redeploy all stacks even when no changes are detected. Destroy: bypass the busy-stack guard and destroy while the target's stacks are mid-operation. App destroys skip destruction confirmation in CI regardless; a tier destroy still needs force to pass its non-interactive confirmation |
 
+A plan and the approval gate cover a full or `infra-only` deploy. `mode: deploy-only` and `image-tag` apply no change set, so they have no plan, and a run of either with `plan`, `require-approval` or `approval-token` is refused before anything is deployed. Through CLI 39.0.8 such a run went ahead without either.
+
 ## Outputs
 
 After the run, the plugin records results as [build meta-data](https://buildkite.com/docs/pipelines/build-meta-data):
@@ -187,14 +189,15 @@ steps:
 
 ### Code Only
 
+A code-only deploy (`mode: deploy-only`) builds and rolls only what the assembly a full deploy writes to `fjall/<app>/cdk.out` declares, so it needs that assembly in the step's checkout. `cdk.out` is not committed, and a step on another agent, an `infra-only` one included, leaves none behind, so a plugin step's checkout holds it only where a deploy in that checkout wrote it. Where it has none, a `mode: deploy-only` step is refused (through CLI 39.0.8 it rolled nothing and exited 0; an app with capacity-identity pins was refused instead). To ship code without a full deploy, roll an image already built with `image-tag`, which rolls the services the app's Compute stack exports with no assembly (an app with a container-image function in the roll needs the assembly for that too, so deploy such an app in full):
+
 ```yaml
 steps:
   - label: ":package: Code"
-    depends_on: infra
     plugins:
       - fjall-tech/fjall-deploy#v29.0.0:
           target: my-app
-          mode: deploy-only
+          image-tag: "app-sha-4f9c2ab0d1e3"
 ```
 
 ### Destroy
@@ -211,6 +214,8 @@ steps:
 
 ### Deploy Specific Service
 
+`service` narrows an `image-tag` roll, or a code-only deploy, to one service. A code-only deploy needs the assembly a full deploy wrote in the step's checkout (Code Only, above):
+
 ```yaml
 steps:
   - label: ":whale: API"
@@ -218,7 +223,7 @@ steps:
       - fjall-tech/fjall-deploy#v29.0.0:
           target: my-app
           service: api
-          mode: deploy-only
+          image-tag: "api-sha-4f9c2ab0d1e3"
 ```
 
 ### Deploy a Tier
