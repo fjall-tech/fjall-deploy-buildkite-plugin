@@ -34,12 +34,17 @@ The CLI authenticates to Fjall via `FJALL_API_KEY` — an app-scoped `fjall_dk_`
 ### AWS Credentials
 
 When `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are both set in the step's
-environment, the CLI uses them and never reaches the Fjall mint, and
-`deploy-target` is resolved against whatever those keys point at rather than
-the target's own account. Otherwise the CLI mints a session from your deploy
-token. Pick one path: an agent or pipeline that exports AWS keys for other
-steps should not export them to the deploy step unless they are the
-credentials the deploy should use.
+environment, the CLI uses them and never reaches the Fjall mint; otherwise it
+mints a session from your deploy token. With fjall 39, an application deploy
+on such keys runs in whatever account they belong to, whatever target
+`deploy-target` or `environment` picks, and in `AWS_REGION` (else
+`AWS_DEFAULT_REGION`, else `us-east-2`) unless `region` is set. From fjall 40,
+the CLI first confirms they belong to that target's account and, when they do
+not, refuses the deploy before it records or changes anything, naming both
+accounts and the variables to unset; keys that belong to it deploy in the
+target's own region unless `region` is set. Pick one path: an agent or pipeline
+that exports AWS keys for other steps should not export them to the deploy
+step unless they are the credentials the deploy should use.
 
 #### Option 1: Fjall OIDC (recommended — no AWS setup)
 
@@ -99,7 +104,7 @@ steps:
     env:
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
-      AWS_REGION: "us-east-2"
+      AWS_REGION: "us-east-1"
     plugins:
       - fjall-tech/fjall-deploy#v29.0.0:
           target: my-app
