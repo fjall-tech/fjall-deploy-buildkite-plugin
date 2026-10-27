@@ -19,9 +19,9 @@ NODE_FLOOR="22.12.0"
 # pinned SHA-256 before use — a tampered or truncated tarball aborts the run
 # rather than executing. Bump the version and BOTH per-arch digests together
 # from https://nodejs.org/dist/v<version>/SHASUMS256.txt.
-NODE_VERSION="24.18.1"
-NODE_SHA256_X64="d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0"
-NODE_SHA256_ARM64="7201e3a09dc825bac57867c81913e2b8f0ef87d04cb9082af4cda82f6ff3d88c"
+NODE_VERSION="24.22.1"
+NODE_SHA256_X64="6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"
+NODE_SHA256_ARM64="dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e"
 
 # Read plugin configuration
 COMMAND="${BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND:-deploy}"
