@@ -5,9 +5,10 @@
  * installs an engine that skews across a major from the constructs the app
  * synthesises. Echoes `fjall@<major>` on stdout for `npm install -g "$(…)"`.
  *
- * Invoked by action.yml when `cli-version: auto`. Takes the app's working
- * directory (where fjall-config.json + package.json live) as argv[1], since the
- * action is a reusable plugin that cannot assume the consumer's repo layout.
+ * Invoked by action.yml when `cli-version: auto`. Takes the working directory,
+ * the folder that holds the project's package.json and its fjall/ folder, as
+ * argv[1], since the action is a reusable plugin that cannot assume the
+ * consumer's repo layout.
  *
  * Fails LOUD (non-zero exit, diagnostics on stderr) when no pin is found or the
  * pins disagree — guessing an engine major is exactly the silent-skew failure
