@@ -739,3 +739,299 @@ teardown() {
   assert_output --partial "'build-secrets' must not begin with '-'"
   refute_output --partial "Installing fjall"
 }
+
+# A deploy build skips itself when a newer deploy build carries its commit.
+# supersede-check.mjs makes that decision, under its own suite
+# (supersedeCheck.test.ts in @fjall/cli). Node is stubbed here, so these tests
+# pin only what the hook does around the decision. That is what it reads, what
+# it hands the module and what it records.
+SUPERSEDE_NEWER_COMMIT="0123456789abcdef0123456789abcdef01234567"
+
+supersede_config() {
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_AFTER="verify-ci-green"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_TOKEN_SECRET="CI_GREEN_API_TOKEN"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIERS_0="prisma/migrations/"
+  export BUILDKITE_COMMIT="fedcba9876543210fedcba9876543210fedcba98"
+  export BUILDKITE_BUILD_URL="https://buildkite.com/acme/webapp-deploy/builds/529"
+}
+
+# Drains setup()'s one-line node plan and replaces it with the version check
+# and one start of the module, whose plan line runs $1.
+stub_supersede_module() {
+  node --version > /dev/null
+  unstub node
+  stub node \
+    "--version : echo 'v${HOOK_NODE_VERSION}'" \
+    "* verify-ci-green prisma/migrations/ : $1"
+}
+
+@test "supersede absent: the hook reads no token and starts no check" {
+  # The buildkite-agent plan is exactly the deploy's two writes, and node's is
+  # only the version check, so a token read or a module start fails unstub.
+  stub buildkite-agent \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  refute_output --partial "supersede:"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede on a rebuild deploys without reading the token" {
+  stub buildkite-agent \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  supersede_config
+  export BUILDKITE_REBUILT_FROM_BUILD_NUMBER="150"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  assert_output --partial "supersede: deploying, a rebuild never skips"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede skip records superseded first, then superseded-by and an annotation, and installs nothing" {
+  stub_supersede_module "echo 'supersede: skipped for #530 at ${SUPERSEDE_NEWER_COMMIT}'; exit 10"
+  # bats-mock consumes a plan in order, so unstub pins the write order too.
+  stub buildkite-agent \
+    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "meta-data set fjall-deploy:result superseded : echo 'RESULT_SET'" \
+    "meta-data set fjall-deploy:superseded-by 530 : echo 'SUPERSEDED_BY_SET'" \
+    "annotate --style warning --context fjall-deploy-superseded * : printf 'ANNOTATION:%s\n' \"\$6\""
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  assert_output --partial "supersede: skipped for #530 at ${SUPERSEDE_NEWER_COMMIT}"
+  assert_output --partial "RESULT_SET"
+  assert_output --partial "SUPERSEDED_BY_SET"
+  assert_output --partial "ANNOTATION:This build deployed nothing. Build [#530](https://buildkite.com/acme/webapp-deploy/builds/530), at \`012345678\`"
+  refute_output --partial "Installing fjall"
+  refute_output --partial "ci run"
+}
+
+@test "supersede skip whose superseded result cannot be written deploys instead" {
+  stub_supersede_module "echo 'supersede: skipped for #530 at ${SUPERSEDE_NEWER_COMMIT}'; exit 10"
+  stub buildkite-agent \
+    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "meta-data set fjall-deploy:result superseded : exit 1" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  assert_output --partial "supersede: deploying, the result superseded could not be recorded"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede skip still exits 0 when superseded-by and the annotation fail" {
+  stub_supersede_module "echo 'supersede: skipped for #530 at ${SUPERSEDE_NEWER_COMMIT}'; exit 10"
+  stub buildkite-agent \
+    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "meta-data set fjall-deploy:result superseded : true" \
+    "meta-data set fjall-deploy:superseded-by 530 : exit 1" \
+    "annotate --style warning --context fjall-deploy-superseded * : exit 1"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  refute_output --partial "Installing fjall"
+  refute_output --partial "ci run"
+}
+
+@test "supersede starts the module without FJALL_API_KEY, with the token on stdin" {
+  stub_supersede_module "if [ -n \"\${FJALL_API_KEY+set}\" ]; then echo 'KEY_PRESENT' >&2; else echo 'KEY_ABSENT' >&2; fi; IFS= read -r token || true; if [ \"\$token\" = 'bkua_bats' ]; then echo 'TOKEN_ON_STDIN' >&2; fi; echo \"MODULE:\${1##*/}\" >&2; echo 'supersede: deploying, no newer main build can still deploy or has deployed'"
+  stub buildkite-agent \
+    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  assert_output --partial "KEY_ABSENT"
+  refute_output --partial "KEY_PRESENT"
+  assert_output --partial "TOKEN_ON_STDIN"
+  assert_output --partial "MODULE:supersede-check.mjs"
+  assert_output --partial "supersede: deploying, no newer main build can still deploy or has deployed"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede whose check exits on an error deploys" {
+  stub_supersede_module "exit 1"
+  stub buildkite-agent \
+    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  assert_output --partial "supersede: deploying, the check exited 1"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede with an unreadable token secret deploys and says why" {
+  stub buildkite-agent \
+    "secret get CI_GREEN_API_TOKEN : exit 1" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  assert_output --partial "supersede: deploying, the supersede.token-secret secret could not be read"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede beside command: build is refused" {
+  supersede_config
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND="build"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede' is valid only with command: deploy (got 'build')"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede beside a tier target is refused" {
+  supersede_config
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="organisation"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "not valid with tier target 'organisation': supersede"
+  refute_output --partial "Installing fjall"
+}
+
+# Unset FJALL_API_KEY so the hook WOULD read a secret if it got that far. The
+# stub's plan line answers that read, and the refusal must come first.
+@test "a flag-shaped supersede barrier is refused before any secret is read" {
+  unset FJALL_API_KEY
+  stub buildkite-agent "secret get FJALL_API_KEY : echo 'SECRET_READ'"
+  supersede_config
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIERS_1="--oops"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede.barriers' must not begin with '-'"
+  refute_output --partial "SECRET_READ"
+  refute_output --partial "Installing fjall"
+}
+
+@test "a supersede barrier with a .. segment is refused" {
+  supersede_config
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIERS_0="prisma/../app"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede.barriers' item 0 has a '..' segment"
+}
+
+@test "a scalar supersede is refused" {
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE="true"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede' must be an object with 'after' and 'token-secret', not a single value."
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede without after is refused" {
+  supersede_config
+  unset BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_AFTER
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede.after' is required."
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede without token-secret is refused" {
+  supersede_config
+  unset BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_TOKEN_SECRET
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede.token-secret' is required."
+  refute_output --partial "Installing fjall"
+}
+
+# Item 1 is missing, so the hook cannot tell the list it was given from the
+# list it read.
+@test "a supersede barriers list with a gap is refused" {
+  supersede_config
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIERS_2="clickhouse-init/"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede.barriers' has no item 1, so its items are not a list."
+  refute_output --partial "Installing fjall"
+}
+
+@test "an empty supersede barrier is refused" {
+  supersede_config
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIERS_0=""
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede.barriers' item 0 is empty."
+  refute_output --partial "Installing fjall"
+}
+
+@test "an absolute supersede barrier is refused" {
+  supersede_config
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIERS_0="/prisma/migrations/"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede.barriers' item 0 is an absolute path."
+  refute_output --partial "Installing fjall"
+}
+
+# A misspelt key would otherwise be a barrier nobody reads, which a skip
+# would step over.
+@test "a supersede key the hook does not read is refused, not ignored" {
+  supersede_config
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIER_0="clickhouse-init/"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "'supersede' sets BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIER_0"
+  refute_output --partial "Installing fjall"
+}

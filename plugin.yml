@@ -70,5 +70,20 @@ configuration:
     force:
       type: boolean
       default: false
+    supersede:
+      type: object
+      properties:
+        after:
+          type: string
+        token-secret:
+          type: string
+        barriers:
+          type: array
+          items:
+            type: string
+      required:
+        - after
+        - token-secret
+      additionalProperties: false
   required:
     - target

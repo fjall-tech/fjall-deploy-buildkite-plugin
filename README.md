@@ -4,6 +4,8 @@ A [Buildkite plugin](https://buildkite.com/docs/plugins) to deploy, destroy, or 
 
 This is a thin shim onto `fjall ci run` — it installs the CLI and delegates. The CLI owns command and flag validation, so an invalid combination (for example `mode` with `command: destroy`) fails with a directional error from `fjall` rather than being silently dropped.
 
+The one exception is `supersede`, which the hook decides itself before it installs the CLI, and never forwards to it (see [Skipping a superseded deploy](#skipping-a-superseded-deploy)).
+
 A tier `target` (`organisation`, `platform`, or `account`) routes to the noun-verb tier command — `fjall org deploy`, `fjall platform destroy`, and so on — and accepts only the flags that tier honours (`force`, `verbose`, and, for `organisation`, `no-cascade`). Any app or deploy-only property paired with a tier target is rejected at the plugin boundary rather than silently dropped.
 
 ## Quick Start
@@ -140,6 +142,7 @@ example) fails when they expire.
 | `cli-version`       | no       | `39`     | Pin the `fjall` CLI version. Defaults to this plugin's compatible major (floats across `39`.x, never crossing into the next major); `auto` derives the major from the app's pinned `@fjall/components-infrastructure`; `latest` always installs the newest published release                        |
 | `working-directory` | no       | `.`      | Folder that holds the project's `fjall/` folder, relative to the repository's checkout. `fjall` runs there                                                                                                                                                                                          |
 | `force`             | no       | `false`  | Deploy: redeploy all stacks even when no changes are detected. Destroy: bypass the busy-stack guard and destroy while the target's stacks are mid-operation. App destroys skip destruction confirmation in CI regardless; a tier destroy still needs force to pass its non-interactive confirmation |
+| `supersede`         | no       | —        | Skip this deploy when a newer `main` build of the same pipeline already carries its commit. An object of `after`, `token-secret` and an optional `barriers` list, valid only with `command: deploy` and an application target. See [Skipping a superseded deploy](#skipping-a-superseded-deploy)    |
 
 A plan and the approval gate cover a full or `infra-only` deploy. `mode: deploy-only` and `image-tag` apply no change set, so they have no plan, and a run of either with `plan`, `require-approval` or `approval-token` is refused before anything is deployed. Through CLI 39.0.8 such a run went ahead without either.
 
@@ -147,11 +150,14 @@ A plan and the approval gate cover a full or `infra-only` deploy. `mode: deploy-
 
 After the run, the plugin records results as [build meta-data](https://buildkite.com/docs/pipelines/build-meta-data):
 
-| Meta-data key                 | Value                                                                      |
-| ----------------------------- | -------------------------------------------------------------------------- |
-| `fjall-deploy:result`         | `success`, `plan-pending` (exit 2 — no mutation), or `failure`             |
-| `fjall-deploy:duration`       | Command duration in seconds                                                |
-| `fjall-deploy:approval-token` | Token from a plan run with pending changes; feed back via `approval-token` |
+| Meta-data key                 | Value                                                                                                                            |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `fjall-deploy:result`         | `success`, `plan-pending` (exit 2, no mutation) or `failure`. With `supersede` set, also `superseded` (exit 0, nothing deployed) |
+| `fjall-deploy:superseded-by`  | Set only with `superseded`. The number of the newer build whose deploy covers this one                                           |
+| `fjall-deploy:duration`       | Command duration in seconds                                                                                                      |
+| `fjall-deploy:approval-token` | Token from a plan run with pending changes; feed back via `approval-token`                                                       |
+
+A `superseded` build records no duration. It posts a warning annotation that names the newer build.
 
 A `plan-pending` result also posts a warning annotation with re-run instructions, and the step exits `2` so downstream steps can gate on it.
 
@@ -178,6 +184,46 @@ steps:
 ```
 
 Pair this with the pipeline settings **Skip Intermediate Builds: ON** (queued stale deploys collapse to the newest) and **Cancel Intermediate Builds: OFF** (never interrupt an in-flight CloudFormation update).
+
+## Skipping a superseded deploy
+
+Set `supersede` when your pipeline creates a deploy build for each green commit on `main`, so an older build that starts late would only repeat what a newer one deploys. A superseded build records `fjall-deploy:result` as `superseded`, posts a warning annotation naming the newer build, and exits `0` without installing the CLI.
+
+```yaml
+steps:
+  - label: ":rocket: Deploy"
+    plugins:
+      - fjall-tech/fjall-deploy#v29:
+          target: my-app
+          supersede:
+            after: verify-ci-green
+            token-secret: CI_GREEN_API_TOKEN
+            barriers:
+              - prisma/migrations/
+```
+
+`supersede` takes three properties.
+
+- `after`, required. The key of a step that must have passed on the newer build before this one gives way to it, such as a step that checks the commit's CI.
+- `token-secret`, required. The name of a [Buildkite secret](https://buildkite.com/docs/pipelines/security/secrets) that holds an API access token with the `read_builds` scope. The hook reads it with `buildkite-agent secret get` and hands it to the check on standard input, so the token itself is never a plugin property.
+- `barriers`, optional. Paths relative to the repository root. A commit that changes a file at one of these paths, or anything under one that is a directory, is a barrier. Each path is read literally, so `*` and `:!` have no special meaning, and `prisma/mig` does not match `prisma/migrations/`. A path that starts with `-` or `/`, or has a `..` segment, is refused before any secret is read.
+
+A build skips only when all of these hold.
+
+- Its creator marked it, by sending `"meta_data": {"fjall-deploy:supersedable": "true"}` in the body of its [create build](https://buildkite.com/docs/apis/rest-api/builds#create-a-build) request. A build started from the dashboard carries no marker, so a hand rollback always deploys.
+- It is a build of `main`, among the 20 newest `main` builds of its pipeline, and not a rebuild.
+- The newest newer build that can still deploy, or has deployed, has passed its `after` step, and its commit has this build's commit in its first parent history. Such a build is running with `fjall-deploy:result` unset or `success`, or passed with `success`. A build that recorded anything else, `superseded` included, will not deploy its commit, so it is passed over.
+- No commit on that newer build's first parent line, from this build's commit up to the newer build's own, is a barrier. A merge commit on that line is judged by its diff against its first parent, which holds the net change of every commit it merged.
+
+Only that one newer build is judged. When it fails either of the last two checks, this build deploys rather than looking at an older one, so it never steps over a hand rollback.
+
+A commit on the newer build's first parent line is also a barrier when a line of its message starts with `deploy-alone`. That holds whenever `supersede` is set, with or without a `barriers` list. Only the messages of commits on that line are read. So when a merge commit or a squash lands your change on `main`, put the `deploy-alone` line in the message of the commit on `main`, at the very start of a line. The same line in a merged topic commit is not read.
+
+Any doubt deploys. The build deploys the commit it was given, as it would without `supersede`, when the secret cannot be read, a read of the builds list fails or runs past its bound (30 s a read, 120 s in all), git fails, or the clone is still shallow after `git fetch --unshallow`. The check prints one line that says whether it skipped and why. It runs without `FJALL_API_KEY` in its environment.
+
+`supersede` needs a plugin release that ships it, so the example above uses the moving major tag. An exact pin of an earlier release runs a hook that ignores `supersede` and deploys every build, and nothing warns that it did.
+
+An agent keeps the checkout it made for a plugin ref and does not fetch that ref again unless it sets `plugins-always-clone-fresh` (Buildkite's [agent configuration](https://buildkite.com/docs/agent/v3/configuration) docs). So an agent that cloned `v29` before `supersede` shipped runs the older hook, which ignores `supersede` and deploys every build. That is safe, and it ends when the agent next clones the plugin fresh.
 
 ## Examples
 
