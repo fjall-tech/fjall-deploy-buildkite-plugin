@@ -144,7 +144,7 @@ example) fails when they expire.
 | `force`             | no       | `false`  | Deploy: redeploy all stacks even when no changes are detected. Destroy: bypass the busy-stack guard and destroy while the target's stacks are mid-operation. App destroys skip destruction confirmation in CI regardless; a tier destroy still needs force to pass its non-interactive confirmation |
 | `supersede`         | no       | —        | Skip this deploy when a newer `main` build of the same pipeline already carries its commit. An object of `after`, `token-secret` and an optional `barriers` list, valid only with `command: deploy` and an application target. See [Skipping a superseded deploy](#skipping-a-superseded-deploy)    |
 
-A plan and the approval gate cover a full or `infra-only` deploy. `mode: deploy-only` and `image-tag` apply no change set, so they have no plan, and a run of either with `plan`, `require-approval` or `approval-token` is refused before anything is deployed. Through CLI 39.0.8 such a run went ahead without either.
+A plan and the approval gate cover a full or `infra-only` deploy. `mode: deploy-only` and `image-tag` change no template, so they have no plan, and a run of either with `plan`, `require-approval` or `approval-token` is refused before anything is deployed. Through CLI 39.0.8 such a run went ahead without either.
 
 ## Outputs
 
