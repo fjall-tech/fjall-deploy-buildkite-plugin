@@ -23,7 +23,9 @@ If the deploy step sets `timeout_in_minutes`, or your pipeline sets a default ti
 
 ## Agent Architecture
 
-Fjall builds ECS images for `linux/arm64`, the platform its tasks run on, so run the deploy step on an arm64 agent queue: a Linux ARM queue on Buildkite-hosted agents, or Graviton instances on self-hosted ones. `fjall ci setup --provider buildkite --queue <name>` writes the queue into the step. An x86 agent builds the image only under emulation: without an emulator registered on the agent a `RUN` step fails with an exec format error, and with one the build typically runs several times slower.
+Fjall builds ECS images for `linux/arm64`, the platform its tasks run on, and a container Lambda's image for its `architecture`. Run the deploy step on an agent queue of the architecture those images build for. For arm64 that is a Linux ARM queue on Buildkite-hosted agents, or Graviton instances on self-hosted ones. `fjall ci setup --provider buildkite --queue <name>` writes the queue into the step, and from fjall 40 the command prints the platform it read from the manifest a synth left in the app's `cdk.out`. It names `linux/amd64` only when that manifest lists only x86_64 images, and warns when the app builds both or `cdk.out` holds no current list.
+
+An x86 agent can run an arm64 image's `RUN` steps only under emulation. The default BuildKit image behind Fjall's `fjall` builder ships an emulator (`buildkit-qemu-aarch64`, checked on BuildKit 0.33.1), and BuildKit documents that most builds need no manual QEMU setup. BuildKit also documents emulation as much slower than a native build, and advises against it for compiling. A `RUN` step can still fail when its container mixes binaries for several architectures. BuildKit's documented cure is to register QEMU on the agent, commonly with the `tonistiigi/binfmt` image.
 
 ## Authentication
 
