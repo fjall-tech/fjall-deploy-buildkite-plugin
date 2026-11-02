@@ -124,7 +124,7 @@ example) fails when they expire.
 | ------------------- | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `command`           | no       | `deploy` | `deploy`, `destroy`, or `build`                                                                                                                                                                                                                                                                     |
 | `target`            | **yes**  | —        | Application name, or a tier: `organisation`, `platform`, `account`. App targets run the app; tier targets route to the noun-verb tier command (`fjall org\|platform\|account deploy\|destroy`). `build` is app-only                                                                                 |
-| `service`           | no       | —        | Specific service name (deploy and build only)                                                                                                                                                                                                                                                       |
+| `service`           | no       | —        | One service (deploy and build only), from fjall 40 by its whole name, ignoring case. Fjall 39 also selects every service whose name ends with it                                                                                                                                                    |
 | `mode`              | no       | `full`   | `full`, `infra-only`, or `deploy-only` (deploy only)                                                                                                                                                                                                                                                |
 | `environment`       | no       | —        | Target environment                                                                                                                                                                                                                                                                                  |
 | `deploy-target`     | no       | —        | Deploy to a specific `fjall target list` target, e.g. `production-use1`; maps to `--target` (the credential where), distinct from `environment`. App targets only                                                                                                                                   |
@@ -265,7 +265,7 @@ steps:
 
 ### Deploy Specific Service
 
-`service` narrows an `image-tag` roll, or a code-only deploy, to one service. A code-only deploy needs the assembly a full deploy wrote in the step's checkout (Code Only, above):
+`service` narrows an `image-tag` roll, or a code-only deploy, to one service. From fjall 40 it selects the service by its whole name, ignoring case, so `service: worker` rolls `worker`, never `scan-worker`, and a name that matches no service is refused, listing the services there are. Fjall 39 also selects every service whose name ends with the name given, so with it `service: worker` rolls `scan-worker` too. A code-only deploy needs the assembly a full deploy wrote in the step's checkout (Code Only, above):
 
 ```yaml
 steps:

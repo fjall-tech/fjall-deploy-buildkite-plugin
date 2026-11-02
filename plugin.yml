@@ -18,6 +18,7 @@ configuration:
       type: string
     service:
       type: string
+      description: "One service (deploy and build only), from fjall 40 by its whole name, ignoring case. Fjall 39 also selects every service whose name ends with it"
     mode:
       type: string
       enum:
