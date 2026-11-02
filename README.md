@@ -53,8 +53,8 @@ step unless they are the credentials the deploy should use.
 Store `FJALL_API_KEY` and export no AWS credentials. The CLI exchanges your
 deploy token with the Fjall API for a short-lived, Fjall-signed web-identity
 token, then calls `sts:AssumeRoleWithWebIdentity` against the
-`FjallDeploy<orgId>` role that `fjall connect` created in your account. The
-deploy token _is_ the pipeline's AWS credential.
+`FjallDeploy<orgId>` role Fjall created when you connected your AWS account.
+The deploy token _is_ the pipeline's AWS credential.
 
 You need no IAM OIDC provider of your own, no deploy role and no AWS secrets.
 An agent's EC2 instance profile plays no part either: the CLI does not read
