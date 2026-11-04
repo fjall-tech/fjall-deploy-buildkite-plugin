@@ -1,5 +1,9 @@
 services:
   tests:
-    image: buildkite/plugin-tester
+    # Pinned by tag and digest, so the suite's verdict on a commit does not
+    # move with an upstream push. This build carries bats-core 1.13.0 and
+    # bats-mock v2.2.0, and the stubs in tests/command.bats rest on that
+    # bats-mock's matching: a bump re-reads them.
+    image: buildkite/plugin-tester:v4.3.0@sha256:86c728d8526e22f5d26c1b65e2cae1dfb2d9767fe24d560563895d051b258c84
     volumes:
       - ".:/plugin"

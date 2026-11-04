@@ -1,429 +1,433 @@
 #!/usr/bin/env bash
+
+# The agent sources a shell hook into its wrapper and, when the hook exits 0,
+# carries what it leaves into the rest of the job: the exported environment,
+# and the working directory the later hooks and the artifact upload start in
+# (agent v3.138.0's internal/job/executor.go, read 2026-10-08). This hook
+# changes both as it runs: it puts a bootstrapped Node first on PATH, which
+# is removed when it ends, it moves into working-directory, and it takes
+# FJALL_API_KEY out of the environment. Sourced, it runs itself as a child of
+# the wrapper instead, so none of that outlives it; a BASH_ENV the job sets
+# is read twice for this hook, once by the wrapper and once by the child.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  "${BASH}" "${BASH_SOURCE[0]}"
+  return
+fi
 set -euo pipefail
+
+# The deploy token is handed to one process the hook runs, the CLI, and to
+# nothing before it: not a property check, the Node bootstrap, npm or the
+# engine resolver. So it leaves the environment before anything runs, and is
+# held in FJALL_API_KEY, unexported, under no second name a job may export
+# too: a job's own DEPLOY_TOKEN, for one, reaches the CLI as the job set it.
+# An allexport the shell inherited (from BASH_ENV, say) would export a
+# fetched token again when it is set, and an inherited xtrace would print it
+# into the job log, so both are turned off first; the braces keep the trace
+# of turning xtrace off out of the log as well. This shell is the hook's own
+# child of the agent's wrapper (the re-exec just above), so none of this
+# reaches a hook after it: those see an environment-supplied token as the
+# hooks before this one did, and never a fetched one.
+set +a
+{ set +x; } 2>/dev/null
+export -n FJALL_API_KEY
 
 # The CLI major this plugin release is built against (design § 5.2 version tie).
 # `cli-version` defaults to it, so a pinned plugin ref floats across this major's
 # minors/patches but never silently crosses into the next. Kept in lockstep with
 # both manifests' `cli-version` default and CI_RUN_INPUT_VOCABULARY's
 # COMPATIBLE_CLI_MAJOR by the ci-plugin parity test.
-FJALL_CLI_DEFAULT_MAJOR="39"
+fjall_cli_default_major="39"
 
 # The `fjall` wrapper's declared `engines.node`. When the agent's node is below
-# this floor (or absent), the hook bootstraps NODE_VERSION from nodejs.org.
+# this floor (or absent), the hook bootstraps node_version from nodejs.org.
 # The floor is a full version, not a major: 22.3.0 is a Node 22 the published
 # package refuses. Kept in lockstep with wrappers/fjall/package.json's
 # `engines.node` by the ci-plugin parity test.
-NODE_FLOOR="22.12.0"
+node_floor="22.12.0"
 
 # The Node build the hook installs when it bootstraps, verified against a
 # pinned SHA-256 before use — a tampered or truncated tarball aborts the run
-# rather than executing. Bump the version and BOTH per-arch digests together
-# from https://nodejs.org/dist/v<version>/SHASUMS256.txt.
-NODE_VERSION="24.22.1"
-NODE_SHA256_X64="6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"
-NODE_SHA256_ARM64="dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e"
+# rather than executing. To bump it, change the version and run
+# `npm run pin:node` in the fjall repository: it stamps both per-arch digests
+# from https://nodejs.org/dist/v<version>/SHASUMS256.txt, and its test holds
+# them to the pins it writes beside the plugin.
+node_version="24.22.1"
+node_sha256_x64="6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"
+node_sha256_arm64="dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e"
 
-# Read plugin configuration
-COMMAND="${BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND:-deploy}"
-TARGET="${BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET:-}"
-SERVICE="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SERVICE:-}"
-MODE="${BUILDKITE_PLUGIN_FJALL_DEPLOY_MODE:-full}"
-ENVIRONMENT="${BUILDKITE_PLUGIN_FJALL_DEPLOY_ENVIRONMENT:-}"
-DEPLOY_TARGET="${BUILDKITE_PLUGIN_FJALL_DEPLOY_DEPLOY_TARGET:-}"
-VERBOSE="${BUILDKITE_PLUGIN_FJALL_DEPLOY_VERBOSE:-false}"
-SKIP_BUILD="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SKIP_BUILD:-false}"
-NO_CASCADE="${BUILDKITE_PLUGIN_FJALL_DEPLOY_NO_CASCADE:-false}"
-REGION="${BUILDKITE_PLUGIN_FJALL_DEPLOY_REGION:-}"
-IMAGE_TAG="${BUILDKITE_PLUGIN_FJALL_DEPLOY_IMAGE_TAG:-}"
-PLAN="${BUILDKITE_PLUGIN_FJALL_DEPLOY_PLAN:-false}"
-REQUIRE_APPROVAL="${BUILDKITE_PLUGIN_FJALL_DEPLOY_REQUIRE_APPROVAL:-false}"
-AUTO_APPROVE="${BUILDKITE_PLUGIN_FJALL_DEPLOY_AUTO_APPROVE:-false}"
-APPROVAL_TOKEN="${BUILDKITE_PLUGIN_FJALL_DEPLOY_APPROVAL_TOKEN:-}"
-CLI_VERSION="${BUILDKITE_PLUGIN_FJALL_DEPLOY_CLI_VERSION:-${FJALL_CLI_DEFAULT_MAJOR}}"
-WORKING_DIR="${BUILDKITE_PLUGIN_FJALL_DEPLOY_WORKING_DIRECTORY:-.}"
-FORCE="${BUILDKITE_PLUGIN_FJALL_DEPLOY_FORCE:-false}"
+# Read plugin configuration. Every variable the hook sets for itself has a
+# lower-case name, where a job's own are upper-case by convention, so each
+# upper-case variable the job exports reaches the CLI, and with it the job's
+# infrastructure.ts and image builds, as the job set it. What the hook does
+# change for the CLI it changes on purpose: PATH on the Node bootstrap path,
+# FJALL_API_KEY when it fetches the token, and the directory the CLI runs in.
+cmd="${BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND:-deploy}"
+target="${BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET:-}"
+service="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SERVICE:-}"
+mode="${BUILDKITE_PLUGIN_FJALL_DEPLOY_MODE:-full}"
+environment="${BUILDKITE_PLUGIN_FJALL_DEPLOY_ENVIRONMENT:-}"
+deploy_target="${BUILDKITE_PLUGIN_FJALL_DEPLOY_DEPLOY_TARGET:-}"
+verbose="${BUILDKITE_PLUGIN_FJALL_DEPLOY_VERBOSE-false}"
+skip_build="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SKIP_BUILD-false}"
+no_cascade="${BUILDKITE_PLUGIN_FJALL_DEPLOY_NO_CASCADE-false}"
+region="${BUILDKITE_PLUGIN_FJALL_DEPLOY_REGION:-}"
+image_tag="${BUILDKITE_PLUGIN_FJALL_DEPLOY_IMAGE_TAG:-}"
+plan="${BUILDKITE_PLUGIN_FJALL_DEPLOY_PLAN-false}"
+require_approval="${BUILDKITE_PLUGIN_FJALL_DEPLOY_REQUIRE_APPROVAL-false}"
+auto_approve="${BUILDKITE_PLUGIN_FJALL_DEPLOY_AUTO_APPROVE-false}"
+approval_token="${BUILDKITE_PLUGIN_FJALL_DEPLOY_APPROVAL_TOKEN:-}"
+cli_version="${BUILDKITE_PLUGIN_FJALL_DEPLOY_CLI_VERSION:-${fjall_cli_default_major}}"
+working_dir="${BUILDKITE_PLUGIN_FJALL_DEPLOY_WORKING_DIRECTORY:-.}"
+force="${BUILDKITE_PLUGIN_FJALL_DEPLOY_FORCE-false}"
+
+# Every property is checked here, before anything is fetched, installed or
+# run. A refusal names the property and the rule, never the value: nothing has
+# shown what a refused value holds, and the step log keeps it. Keep in
+# lockstep with the GitHub Action's action.yml.
+refuse() {
+  echo "^^^ +++"
+  echo "Error: $1"
+  exit 1
+}
+not_repeated="The value given is not repeated here."
+
+# A boolean property is exactly `true` or `false`, which is what the agent
+# hands a hook for any YAML boolean, `True` and `TRUE` included (read in agent
+# v3.138.0's source, 2026-10-08), and the only kind plugin.yml declares. A
+# property left out sets no variable, and takes its default above. Anything
+# else is what the pipeline wrote: a string someone quoted (`"yes"`,
+# `"True"`), an unquoted number (`1`), a `yes` or `on` the agent's YAML 1.2
+# parser keeps as a string, or an interpolation that came out empty
+# (`"${PLAN_ONLY}"` with the variable unset). The reads below would take any
+# of them as false, which for plan, require-approval and no-cascade is the
+# arm that changes more.
+require_boolean() {
+  case "$2" in
+    true | false) ;;
+    "") refuse "'$1' is empty: give true or false, or leave it out to take its default." ;;
+    *) refuse "'$1' must be true or false. ${not_repeated}" ;;
+  esac
+}
+require_boolean verbose "${verbose}"
+require_boolean skip-build "${skip_build}"
+require_boolean no-cascade "${no_cascade}"
+require_boolean plan "${plan}"
+require_boolean require-approval "${require_approval}"
+require_boolean auto-approve "${auto_approve}"
+require_boolean force "${force}"
+
+# A string property the pipeline wrote but left empty is refused too, and
+# for the same cause: the agent sets no variable for a property left out,
+# so an empty one is what the pipeline wrote, most often an interpolation
+# whose variable was unset. Each read takes it as the property left out,
+# so an empty image-tag would build and deploy rather than roll back. An
+# empty target is refused as a missing one, and an empty list or list item
+# by the list check.
+require_value() {
+  local var
+  var="BUILDKITE_PLUGIN_FJALL_DEPLOY_$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
+  if [ -n "${!var+set}" ] && [ -z "${!var}" ]; then
+    refuse "'$1' is empty: give it a value, or leave it out."
+  fi
+}
+require_value command
+require_value service
+require_value mode
+require_value environment
+require_value deploy-target
+require_value region
+require_value image-tag
+require_value approval-token
+require_value cli-version
+require_value working-directory
+
+# `-` is the spelling of "none" for a property with no value of its own, as
+# in the GitHub Action, whose inputs default to it: a pipeline that may have
+# no value writes `image-tag: "${ROLLBACK_TAG:--}"`, and the property reads
+# as left out. None of these properties takes a value beginning with `-`.
+# A list property's single `-` is read by the list check. Keep in lockstep
+# with the GitHub Action's action.yml.
+for name in service environment deploy_target region image_tag approval_token; do
+  if [ "${!name}" = "-" ]; then
+    printf -v "${name}" '%s' ""
+  fi
+done
+
+# `-` means none only for a property with no value of its own. Of the rest,
+# cli-version would hand it to npm as a version and working-directory to cd,
+# which reads it as the previous directory, so both refuse it, as the other
+# property checks refuse it everywhere else.
+reject_none_marker() {
+  if [ "$2" = "-" ]; then
+    refuse "'$1' cannot be '-', which means none only for a property without a default: leave it out to take its default."
+  fi
+}
+reject_none_marker cli-version "${cli_version}"
+reject_none_marker working-directory "${working_dir}"
 
 # Reject flag-shaped property values before they reach fjall. Property values
 # are interpolated from pipeline YAML; a value beginning with '-' would be
 # parsed by commander as a flag rather than a value, even though each is passed
-# as a quoted argv element. Fail fast. Keep in lockstep with the GitHub
-# Action's action.yml.
+# as a quoted argv element.
 reject_leading_dash() {
   case "$2" in
-    -*)
-      echo "^^^ +++"
-      echo "Error: '$1' must not begin with '-' (got '$2')."
-      exit 1
-      ;;
+    -*) refuse "'$1' must not begin with '-'. ${not_repeated}" ;;
   esac
 }
-reject_leading_dash command "${COMMAND}"
-reject_leading_dash target "${TARGET}"
-reject_leading_dash service "${SERVICE}"
-reject_leading_dash mode "${MODE}"
-reject_leading_dash environment "${ENVIRONMENT}"
-reject_leading_dash deploy-target "${DEPLOY_TARGET}"
-reject_leading_dash region "${REGION}"
-reject_leading_dash image-tag "${IMAGE_TAG}"
-reject_leading_dash approval-token "${APPROVAL_TOKEN}"
+reject_leading_dash command "${cmd}"
+reject_leading_dash target "${target}"
+reject_leading_dash service "${service}"
+reject_leading_dash mode "${mode}"
+reject_leading_dash environment "${environment}"
+reject_leading_dash deploy-target "${deploy_target}"
+reject_leading_dash region "${region}"
+reject_leading_dash image-tag "${image_tag}"
+reject_leading_dash approval-token "${approval_token}"
 
-# The same guard per item for the array properties, HERE rather than in the
-# argv-composition loops below: a flag-shaped item must fail before the
-# secret fetch and the Node/CLI install, not after them.
-reject_flag_shaped_items() {
-  local property="$1" env_prefix="$2" i=0 var value
-  while true; do
-    var="${env_prefix}${i}"
-    value="${!var:-}"
-    if [ -z "${value}" ]; then
-      break
+# A list property arrives as indexed variables (_0, _1, ...), each item
+# guarded like the scalars. A single value arrives under the bare name, a map
+# or a list of maps under non-numeric suffixes, and an empty item would end
+# the composition loops below early: each would drop items without a word, so
+# each is refused, but for a single `-`, which reads as the property left
+# out. The prefix's names are passed in, expanded at the call.
+check_list_property() {
+  local property="$1" prefix="$2" i=0 var
+  shift 2
+  if [ -n "${!prefix+set}" ]; then
+    if [ "${!prefix}" = "-" ]; then
+      return
     fi
-    reject_leading_dash "${property}" "${value}"
+    if [ -z "${!prefix}" ]; then
+      refuse "'${property}' is empty: give it a list of strings, or leave it out."
+    fi
+    refuse "'${property}' must be a list of strings, not a single value. ${not_repeated}"
+  fi
+  while var="${prefix}_${i}" && [ -n "${!var+set}" ]; do
+    if [ -z "${!var}" ]; then
+      refuse "'${property}' item $((i + 1)) is empty."
+    fi
+    reject_leading_dash "${property}" "${!var}"
     i=$((i + 1))
   done
+  if [ "$#" -ne "${i}" ]; then
+    refuse "'${property}' must be a list of strings. ${not_repeated}"
+  fi
 }
-reject_flag_shaped_items build-args BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_
-reject_flag_shaped_items build-secrets BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS_
+# shellcheck disable=SC2086 # variable names, which cannot split or glob
+check_list_property build-args BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS ${!BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_@}
+# shellcheck disable=SC2086 # variable names, which cannot split or glob
+check_list_property build-secrets BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS ${!BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS_@}
 
-if [ -z "${TARGET}" ]; then
+if [ -z "${target}" ]; then
   echo "^^^ +++"
   echo "Error: 'target' is required"
   exit 1
 fi
 
-refuse_supersede() {
-  echo "^^^ +++"
-  echo "Error: $1"
-  exit 1
-}
-
-# `supersede` is an object, so Buildkite sets only its leaves, _AFTER,
-# _TOKEN_SECRET and _BARRIERS_<n>. Any other name under the prefix is a
-# misspelt key or a wrong shape, refused here rather than ignored, since a
-# barrier the hook never read is a barrier a skip would step over. All of it
-# is checked before any secret is read or anything is installed.
-SUPERSEDE="false"
-SUPERSEDE_AFTER="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_AFTER:-}"
-SUPERSEDE_TOKEN_SECRET="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_TOKEN_SECRET:-}"
-SUPERSEDE_BARRIERS=()
-SUPERSEDE_BARRIER_NAMES=0
-for name in ${!BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE@}; do
-  SUPERSEDE="true"
-  suffix="${name#BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE}"
-  if [ -z "${suffix}" ]; then
-    refuse_supersede "'supersede' must be an object with 'after' and 'token-secret', not a single value."
-  elif [ "${suffix}" = "_AFTER" ] || [ "${suffix}" = "_TOKEN_SECRET" ]; then
-    :
-  elif [[ "${suffix}" =~ ^_BARRIERS_(0|[1-9][0-9]*)$ ]]; then
-    SUPERSEDE_BARRIER_NAMES=$((SUPERSEDE_BARRIER_NAMES + 1))
-  else
-    refuse_supersede "'supersede' sets ${name}, which is not after, token-secret or a barriers list item."
-  fi
-done
-
-if [ "${SUPERSEDE}" = "true" ]; then
-  if [ "${COMMAND}" != "deploy" ]; then
-    refuse_supersede "'supersede' is valid only with command: deploy (got '${COMMAND}')."
-  fi
-  case "${TARGET}" in
-    organisation | platform | account)
-      refuse_supersede "these properties are not valid with tier target '${TARGET}': supersede. Tier deploys accept only force, verbose, and no-cascade (organisation only)."
+# `supersede` is an object, so the agent sets only its leaves, _AFTER,
+# _TOKEN_SECRET and _BARRIERS_<n>. A single value arrives under the bare name,
+# where `-` reads as the property left out, as it does for every property
+# with no value of its own. Any other name under the prefix is a misspelt key
+# or a wrong shape, refused here rather than ignored, since a barrier the hook
+# never read is a barrier a skip would step over.
+supersede="false"
+supersede_after="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_AFTER-}"
+supersede_token_secret="${BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_TOKEN_SECRET-}"
+supersede_barriers=()
+supersede_barrier_count=0
+for supersede_var in ${!BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE@}; do
+  case "${supersede_var#BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE}" in
+    "")
+      case "${!supersede_var}" in
+        -) ;;
+        "") refuse "'supersede' is empty: give it an object with 'after' and 'token-secret', or leave it out." ;;
+        *) refuse "'supersede' must be an object with 'after' and 'token-secret', not a single value. ${not_repeated}" ;;
+      esac
+      ;;
+    _AFTER | _TOKEN_SECRET) supersede="true" ;;
+    _BARRIERS)
+      supersede="true"
+      case "${!supersede_var}" in
+        -) ;;
+        "") refuse "'supersede.barriers' is empty: give it a list of strings, or leave it out." ;;
+        *) refuse "'supersede.barriers' must be a list of strings, not a single value. ${not_repeated}" ;;
+      esac
+      ;;
+    *)
+      if ! [[ "${supersede_var}" =~ ^BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIERS_(0|[1-9][0-9]*)$ ]]; then
+        refuse "'supersede' sets ${supersede_var}, which is not after, token-secret or a barriers list item."
+      fi
+      supersede="true"
+      supersede_barrier_count=$((supersede_barrier_count + 1))
       ;;
   esac
-  if [ -z "${SUPERSEDE_AFTER}" ]; then
-    refuse_supersede "'supersede.after' is required. It names the step that must have passed on the newer build."
+done
+
+# A leaf left out is required, and an empty one is refused as the empty
+# properties above are.
+require_supersede_leaf() {
+  local var
+  var="BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
+  if [ -z "${!var+set}" ]; then
+    refuse "'supersede.$1' is required. $2"
   fi
-  if [ -z "${SUPERSEDE_TOKEN_SECRET}" ]; then
-    refuse_supersede "'supersede.token-secret' is required. It names the Buildkite secret that holds a read_builds token."
+  if [ -z "${!var}" ]; then
+    refuse "'supersede.$1' is empty: give it a value. $2"
   fi
-  reject_leading_dash supersede.after "${SUPERSEDE_AFTER}"
-  reject_leading_dash supersede.token-secret "${SUPERSEDE_TOKEN_SECRET}"
+}
+
+if [ "${supersede}" = "true" ]; then
+  case "${cmd}" in
+    deploy) ;;
+    destroy | build) refuse "'supersede' is valid only with command: deploy (got '${cmd}')." ;;
+    *) refuse "'supersede' is valid only with command: deploy. ${not_repeated}" ;;
+  esac
+  require_supersede_leaf after "It names the step that must have passed on the newer build."
+  require_supersede_leaf token-secret "It names the Buildkite secret that holds a read_builds token."
+  reject_leading_dash supersede.after "${supersede_after}"
+  reject_leading_dash supersede.token-secret "${supersede_token_secret}"
   i=0
-  while [ "${i}" -lt "${SUPERSEDE_BARRIER_NAMES}" ]; do
+  while [ "${i}" -lt "${supersede_barrier_count}" ]; do
     var="BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIERS_${i}"
     if [ -z "${!var+set}" ]; then
-      refuse_supersede "'supersede.barriers' has no item ${i}, so its items are not a list."
+      refuse "'supersede.barriers' has no item ${i}, so its items are not a list."
     fi
     value="${!var}"
     if [ -z "${value}" ]; then
-      refuse_supersede "'supersede.barriers' item ${i} is empty."
+      refuse "'supersede.barriers' item ${i} is empty."
     fi
     reject_leading_dash supersede.barriers "${value}"
     case "/${value}/" in
-      //*) refuse_supersede "'supersede.barriers' item ${i} is an absolute path. Barriers are relative to the repository root." ;;
-      */../*) refuse_supersede "'supersede.barriers' item ${i} has a '..' segment." ;;
+      //*) refuse "'supersede.barriers' item ${i} is an absolute path. Barriers are relative to the repository root." ;;
+      */../*) refuse "'supersede.barriers' item ${i} has a '..' segment." ;;
     esac
-    SUPERSEDE_BARRIERS+=("${value}")
+    supersede_barriers+=("${value}")
     i=$((i + 1))
   done
 fi
-
-# Fetch the deploy token from Buildkite's secret store when the environment
-# hasn't already supplied it. `buildkite-agent secret get` reads the pipeline's
-# FJALL_API_KEY secret; the CLI reads FJALL_API_KEY before stored credentials.
-if [ -z "${FJALL_API_KEY:-}" ]; then
-  if command -v buildkite-agent > /dev/null 2>&1; then
-    echo "--- :key: Fetching FJALL_API_KEY from Buildkite secrets"
-    FJALL_API_KEY="$(buildkite-agent secret get FJALL_API_KEY)"
-    export FJALL_API_KEY
-  fi
-fi
-
-# Bootstrap Node when the agent's runtime is below the wrapper's floor (or
-# absent). Fetch the pinned build, verify its SHA-256 before extracting, and
-# prepend it to PATH so `npm`/`fjall` resolve to it. A digest mismatch aborts
-# under `set -e` rather than executing an unverified binary.
-NODE_AGENT_VERSION="0.0.0"
-if command -v node > /dev/null 2>&1; then
-  NODE_AGENT_VERSION="$(node --version 2>/dev/null || echo v0.0.0)"
-  NODE_AGENT_VERSION="${NODE_AGENT_VERSION#v}"
-fi
-NODE_AGENT_VERSION="${NODE_AGENT_VERSION:-0.0.0}"
-# Compare the FULL version, not the major: an agent on 22.3.0 passes a
-# `-lt 22` test and still cannot run the CLI. `sort -V` orders versions and is
-# present on GNU coreutils, macOS and busybox; the lower of the pair is the
-# agent's exactly when the agent is below the floor. The first line is taken by
-# expansion rather than `| head -n 1`: head exits on the first line, and the
-# SIGPIPE that lands on sort fails the whole substitution under `pipefail`.
-NODE_SORTED="$(printf '%s\n%s\n' "${NODE_AGENT_VERSION}" "${NODE_FLOOR}" | sort -V)"
-NODE_LOWEST="${NODE_SORTED%%$'\n'*}"
-if [ "${NODE_AGENT_VERSION}" != "${NODE_FLOOR}" ] && [ "${NODE_LOWEST}" = "${NODE_AGENT_VERSION}" ]; then
-  # The pinned builds are Linux tarballs, and `uname -m` spells arm64 the same
-  # on macOS: without this, a macOS agent would put a Linux ELF first on PATH
-  # and die at `npm install` with an exec-format error that names nothing.
-  NODE_OS="$(uname -s)"
-  if [ "${NODE_OS}" != "Linux" ]; then
-    echo "^^^ +++"
-    echo "Error: agent node ${NODE_AGENT_VERSION} is below ${NODE_FLOOR}, and the Node bootstrap installs Linux builds only (this agent runs ${NODE_OS}); install Node >= ${NODE_FLOOR} on the agent."
-    exit 1
-  fi
-  echo "--- :node: Bootstrapping Node ${NODE_VERSION} (agent node: ${NODE_AGENT_VERSION}, floor: ${NODE_FLOOR})"
-  case "$(uname -m)" in
-    x86_64 | amd64) NODE_ARCH="x64"; NODE_SHA256="${NODE_SHA256_X64}" ;;
-    aarch64 | arm64) NODE_ARCH="arm64"; NODE_SHA256="${NODE_SHA256_ARM64}" ;;
-    *)
-      echo "^^^ +++"
-      echo "Error: unsupported architecture '$(uname -m)' for Node bootstrap; install Node >= ${NODE_FLOOR} on the agent."
-      exit 1
-      ;;
-  esac
-  NODE_DIST="node-v${NODE_VERSION}-linux-${NODE_ARCH}"
-  NODE_TARBALL="${NODE_DIST}.tar.xz"
-  NODE_TMP="$(mktemp -d)"
-  # Reap the extracted tree on exit — including a set -e abort at the digest
-  # gate — so a persistent self-hosted agent does not accumulate a Node tree per
-  # build. Armed only once the dir exists, so the earlier exits never fire it.
-  trap 'rm -rf "${NODE_TMP:-}"' EXIT
-  curl -fsSL -o "${NODE_TMP}/${NODE_TARBALL}" "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TARBALL}"
-  if command -v sha256sum > /dev/null 2>&1; then
-    echo "${NODE_SHA256}  ${NODE_TMP}/${NODE_TARBALL}" | sha256sum -c -
-  else
-    echo "${NODE_SHA256}  ${NODE_TMP}/${NODE_TARBALL}" | shasum -a 256 -c -
-  fi
-  tar -xJf "${NODE_TMP}/${NODE_TARBALL}" -C "${NODE_TMP}"
-  export PATH="${NODE_TMP}/${NODE_DIST}/bin:${PATH}"
-  echo "Bootstrapped Node ${NODE_VERSION}"
-fi
-
-PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-
-# Skip this deploy when a newer deploy build already carries its commit. The
-# decision is supersede-check.mjs's, and only its positive proof skips. Every
-# other outcome falls through to the deploy. The module runs without the
-# deploy key and takes the read token on stdin, never argv or env.
-if [ "${SUPERSEDE}" = "true" ]; then
-  echo "--- :fast_forward: Checking for a newer deploy that carries this commit"
-  if [ -n "${BUILDKITE_REBUILT_FROM_BUILD_NUMBER:-}" ]; then
-    echo "supersede: deploying, a rebuild never skips"
-  elif ! command -v buildkite-agent > /dev/null 2>&1; then
-    echo "supersede: deploying, buildkite-agent is not on this agent's PATH"
-  elif ! SUPERSEDE_TOKEN="$(buildkite-agent secret get "${SUPERSEDE_TOKEN_SECRET}")" || [ -z "${SUPERSEDE_TOKEN}" ]; then
-    echo "supersede: deploying, the supersede.token-secret secret could not be read"
-  else
-    set +e
-    SUPERSEDE_LINE="$(printf '%s' "${SUPERSEDE_TOKEN}" | env -u FJALL_API_KEY node "${PLUGIN_DIR}/supersede-check.mjs" "${SUPERSEDE_AFTER}" ${SUPERSEDE_BARRIERS[@]+"${SUPERSEDE_BARRIERS[@]}"})"
-    SUPERSEDE_STATUS=$?
-    set -e
-    SUPERSEDE_TOKEN=""
-    echo "${SUPERSEDE_LINE}"
-    SKIP_LINE_PATTERN='^supersede: skipped for #([1-9][0-9]*) at ([0-9a-f]{40})$'
-    if [ "${SUPERSEDE_STATUS}" -eq 10 ] && [[ "${SUPERSEDE_LINE}" =~ ${SKIP_LINE_PATTERN} ]]; then
-      NEWER_NUMBER="${BASH_REMATCH[1]}"
-      NEWER_COMMIT="${BASH_REMATCH[2]}"
-      # The result is written first, and a skip that cannot record it deploys.
-      # A build that deployed nothing with no `superseded` on it would send its
-      # readers looking for a deploy of this commit that never happens.
-      # `meta-data set` writes to the build of `--job`, which defaults to
-      # BUILDKITE_JOB_ID, a standard variable a build's env cannot override.
-      # Unlike `get` it has no `--build`, so adding one would fail this write
-      # and turn every skip into a deploy.
-      if buildkite-agent meta-data set "fjall-deploy:result" "superseded"; then
-        buildkite-agent meta-data set "fjall-deploy:superseded-by" "${NEWER_NUMBER}" || true
-        NEWER_BUILD="#${NEWER_NUMBER}"
-        if [ -n "${BUILDKITE_BUILD_URL:-}" ]; then
-          NEWER_BUILD="[#${NEWER_NUMBER}](${BUILDKITE_BUILD_URL%/*}/${NEWER_NUMBER})"
-        fi
-        OWN_COMMIT="${BUILDKITE_COMMIT:-}"
-        buildkite-agent annotate --style warning --context fjall-deploy-superseded \
-          "This build deployed nothing. Build ${NEWER_BUILD}, at \`${NEWER_COMMIT:0:9}\`, is newer, has passed its \`${SUPERSEDE_AFTER}\` step and carries this build's commit \`${OWN_COMMIT:0:9}\`, so its deploy covers this one." || true
-        exit 0
-      fi
-      echo "supersede: deploying, the result superseded could not be recorded"
-    elif [ "${SUPERSEDE_STATUS}" -ne 0 ]; then
-      echo "supersede: deploying, the check exited ${SUPERSEDE_STATUS}"
-    fi
-  fi
-fi
-
-# Install CLI
-echo "--- :package: Installing fjall"
-if [ "${CLI_VERSION}" = "latest" ]; then
-  npm install -g fjall
-elif [ "${CLI_VERSION}" = "auto" ]; then
-  # Match the engine major to the app's pinned @fjall/components-infrastructure
-  # so the deploy engine never skews across a major from the constructs it
-  # synthesises (engine-version contract). The resolver ships alongside this
-  # hook; WORKING_DIR reaches it via argv, never interpolated into the shell.
-  # Kept byte-identical to the GitHub Action's resolver (parity test locks it).
-  if ! RESOLVED_ENGINE_SPEC="$(node "${PLUGIN_DIR}/resolve-fjall-engine.mjs" "${WORKING_DIR}")"; then
-    echo "Failed to resolve the fjall engine from the app's @fjall/components-infrastructure pin" >&2
-    exit 1
-  fi
-  # An exit status is not an answer. The resolver prints one line and exits 0;
-  # a status-only check reads a silent success as a spec and hands the empty
-  # string to npm, which installs something nobody chose on the lane whose
-  # whole purpose is to pick the right major. Emptiness is its own refusal.
-  if [ -z "${RESOLVED_ENGINE_SPEC}" ]; then
-    echo "The fjall engine resolver exited 0 without naming an engine — refusing to install an unnamed one" >&2
-    exit 1
-  fi
-  npm install -g "${RESOLVED_ENGINE_SPEC}"
-else
-  npm install -g "fjall@${CLI_VERSION}"
-fi
-echo "Installed $(fjall --version)"
 
 # Classify the target. The app-only `ci run <cmd> <target>` shim rejects the
 # tier words (T3: tier deploys and destroys are noun-verb), so an
 # organisation/platform/account target routes to `fjall <noun> <cmd>` while an
 # app target keeps the ci run shim. Build arguments as an array — never a
-# space-joined string. A bare `fjall ${ARGS}` word-splits and glob-expands
+# space-joined string. A bare `fjall ${args}` word-splits and glob-expands
 # every input, so a target/service/environment value carrying spaces, `*`, or
 # extra `--flags` would inject arguments into the CLI invocation. The
-# quoted-array form `fjall "${ARGS[@]}"` passes each value as exactly one argv
+# quoted-array form `fjall "${args[@]}"` passes each value as exactly one argv
 # element. Keep this branching in lockstep with the GitHub Action's action.yml.
-case "${TARGET}" in
-  organisation) TIER_NOUN="org" ;;
-  platform) TIER_NOUN="platform" ;;
-  account) TIER_NOUN="account" ;;
-  *) TIER_NOUN="" ;;
+case "${target}" in
+  organisation) tier_noun="org" ;;
+  platform) tier_noun="platform" ;;
+  account) tier_noun="account" ;;
+  *) tier_noun="" ;;
 esac
 
-if [ -n "${TIER_NOUN}" ]; then
+if [ -n "${tier_noun}" ]; then
   # Tier path. The tier leaves honour only --force, --verbose and
   # (organisation) --no-cascade — every app/deploy-only/approval-gate input is
   # rejected here rather than silently dropped, so a `plan: true` can never
   # become an unpreviewed tier mutation.
-  if [ "${COMMAND}" != "deploy" ] && [ "${COMMAND}" != "destroy" ]; then
+  if [ "${cmd}" != "deploy" ] && [ "${cmd}" != "destroy" ]; then
     echo "^^^ +++"
-    echo "Error: command '${COMMAND}' is application-only; tier target '${TARGET}' supports deploy and destroy only."
+    echo "Error: tier target '${target}' supports the commands deploy and destroy only (build is application-only). The value given is not repeated here."
     exit 1
   fi
 
-  INCOMPATIBLE=()
-  if [ -n "${SERVICE}" ]; then INCOMPATIBLE+=("service"); fi
-  if [ -n "${MODE}" ] && [ "${MODE}" != "full" ]; then INCOMPATIBLE+=("mode"); fi
-  if [ -n "${ENVIRONMENT}" ]; then INCOMPATIBLE+=("environment"); fi
-  if [ -n "${DEPLOY_TARGET}" ]; then INCOMPATIBLE+=("deploy-target"); fi
-  if [ "${SKIP_BUILD}" = "true" ]; then INCOMPATIBLE+=("skip-build"); fi
-  if [ -n "${REGION}" ]; then INCOMPATIBLE+=("region"); fi
-  if [ -n "${IMAGE_TAG}" ]; then INCOMPATIBLE+=("image-tag"); fi
-  if [ "${PLAN}" = "true" ]; then INCOMPATIBLE+=("plan"); fi
-  if [ "${REQUIRE_APPROVAL}" = "true" ]; then INCOMPATIBLE+=("require-approval"); fi
-  if [ "${AUTO_APPROVE}" = "true" ]; then INCOMPATIBLE+=("auto-approve"); fi
-  if [ -n "${APPROVAL_TOKEN}" ]; then INCOMPATIBLE+=("approval-token"); fi
-  if [ -n "${BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_0:-}" ]; then INCOMPATIBLE+=("build-args"); fi
-  if [ -n "${BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS_0:-}" ]; then INCOMPATIBLE+=("build-secrets"); fi
-  if [ "${#INCOMPATIBLE[@]}" -gt 0 ]; then
+  incompatible=()
+  if [ -n "${service}" ]; then incompatible+=("service"); fi
+  if [ -n "${mode}" ] && [ "${mode}" != "full" ]; then incompatible+=("mode"); fi
+  if [ -n "${environment}" ]; then incompatible+=("environment"); fi
+  if [ -n "${deploy_target}" ]; then incompatible+=("deploy-target"); fi
+  if [ "${skip_build}" = "true" ]; then incompatible+=("skip-build"); fi
+  if [ -n "${region}" ]; then incompatible+=("region"); fi
+  if [ -n "${image_tag}" ]; then incompatible+=("image-tag"); fi
+  if [ "${plan}" = "true" ]; then incompatible+=("plan"); fi
+  if [ "${require_approval}" = "true" ]; then incompatible+=("require-approval"); fi
+  if [ "${auto_approve}" = "true" ]; then incompatible+=("auto-approve"); fi
+  if [ -n "${approval_token}" ]; then incompatible+=("approval-token"); fi
+  if [ -n "${BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_0:-}" ]; then incompatible+=("build-args"); fi
+  if [ -n "${BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS_0:-}" ]; then incompatible+=("build-secrets"); fi
+  if [ "${supersede}" = "true" ]; then incompatible+=("supersede"); fi
+  if [ "${#incompatible[@]}" -gt 0 ]; then
     echo "^^^ +++"
-    echo "Error: these properties are not valid with tier target '${TARGET}': ${INCOMPATIBLE[*]}. Tier ${COMMAND}s accept only force, verbose, and no-cascade (organisation only)."
+    echo "Error: these properties are not valid with tier target '${target}': ${incompatible[*]}. Tier ${cmd}s accept only force, verbose, and no-cascade (organisation only)."
     exit 1
   fi
 
-  if [ "${NO_CASCADE}" = "true" ] && [ "${TARGET}" != "organisation" ]; then
+  if [ "${no_cascade}" = "true" ] && [ "${target}" != "organisation" ]; then
     echo "^^^ +++"
     echo "Error: no-cascade is only valid with target: organisation; the platform and account tiers have no cascade."
     exit 1
   fi
 
-  ARGS=("${TIER_NOUN}" "${COMMAND}" --non-interactive)
-  if [ "${FORCE}" = "true" ]; then
-    ARGS+=(--force)
+  args=("${tier_noun}" "${cmd}" --non-interactive)
+  if [ "${force}" = "true" ]; then
+    args+=(--force)
   fi
-  if [ "${VERBOSE}" = "true" ]; then
-    ARGS+=(--verbose)
+  if [ "${verbose}" = "true" ]; then
+    args+=(--verbose)
   fi
-  if [ "${NO_CASCADE}" = "true" ]; then
-    ARGS+=(--no-cascade)
+  if [ "${no_cascade}" = "true" ]; then
+    args+=(--no-cascade)
   fi
 else
   # App path — thin shim onto `fjall ci run`; the CLI owns argv assembly and
   # command/flag validation (unknown commands, deploy-only flags on
   # destroy/build, mode vocabulary). --no-cascade is an organisation-tier
   # concept the ci run surface no longer accepts.
-  if [ "${NO_CASCADE}" = "true" ]; then
+  if [ "${no_cascade}" = "true" ]; then
     echo "^^^ +++"
-    echo "Error: no-cascade is only valid with target: organisation; application '${TARGET}' has no cascade."
+    echo "Error: no-cascade is only valid with target: organisation; application '${target}' has no cascade."
     exit 1
   fi
 
-  ARGS=(ci run "${COMMAND}" "${TARGET}")
+  args=(ci run "${cmd}" "${target}")
 
-  if [ -n "${SERVICE}" ]; then
-    ARGS+=(--service "${SERVICE}")
+  if [ -n "${service}" ]; then
+    args+=(--service "${service}")
   fi
 
   # Always non-interactive in CI
-  ARGS+=(--non-interactive)
+  args+=(--non-interactive)
 
-  if [ -n "${MODE}" ] && [ "${MODE}" != "full" ]; then
-    ARGS+=(--mode "${MODE}")
+  if [ -n "${mode}" ] && [ "${mode}" != "full" ]; then
+    args+=(--mode "${mode}")
   fi
 
-  if [ -n "${ENVIRONMENT}" ]; then
-    ARGS+=(--environment "${ENVIRONMENT}")
+  if [ -n "${environment}" ]; then
+    args+=(--environment "${environment}")
   fi
 
-  if [ -n "${DEPLOY_TARGET}" ]; then
-    ARGS+=(--target "${DEPLOY_TARGET}")
+  if [ -n "${deploy_target}" ]; then
+    args+=(--target "${deploy_target}")
   fi
 
-  if [ "${SKIP_BUILD}" = "true" ]; then
-    ARGS+=(--skip-build)
+  if [ "${skip_build}" = "true" ]; then
+    args+=(--skip-build)
   fi
 
-  if [ -n "${REGION}" ]; then
-    ARGS+=(--region "${REGION}")
+  if [ -n "${region}" ]; then
+    args+=(--region "${region}")
   fi
 
-  if [ -n "${IMAGE_TAG}" ]; then
-    ARGS+=(--image-tag "${IMAGE_TAG}")
+  if [ -n "${image_tag}" ]; then
+    args+=(--image-tag "${image_tag}")
   fi
 
-  if [ "${PLAN}" = "true" ]; then
-    ARGS+=(--plan)
+  if [ "${plan}" = "true" ]; then
+    args+=(--plan)
   fi
 
-  if [ "${REQUIRE_APPROVAL}" = "true" ]; then
-    ARGS+=(--require-approval)
+  if [ "${require_approval}" = "true" ]; then
+    args+=(--require-approval)
   fi
 
-  if [ "${AUTO_APPROVE}" = "true" ]; then
-    ARGS+=(--auto-approve)
+  if [ "${auto_approve}" = "true" ]; then
+    args+=(--auto-approve)
   fi
 
-  if [ -n "${APPROVAL_TOKEN}" ]; then
-    ARGS+=(--approval-token "${APPROVAL_TOKEN}")
+  if [ -n "${approval_token}" ]; then
+    args+=(--approval-token "${approval_token}")
   fi
 
   # Buildkite array properties arrive as indexed env vars (_0, _1, ...)
@@ -434,7 +438,7 @@ else
     if [ -z "${value}" ]; then
       break
     fi
-    ARGS+=(--build-arg "${value}")
+    args+=(--build-arg "${value}")
     i=$((i + 1))
   done
 
@@ -445,63 +449,246 @@ else
     if [ -z "${value}" ]; then
       break
     fi
-    ARGS+=(--build-secret "${value}")
+    args+=(--build-secret "${value}")
     i=$((i + 1))
   done
 
-  if [ "${FORCE}" = "true" ]; then
-    ARGS+=(--force)
+  if [ "${force}" = "true" ]; then
+    args+=(--force)
   fi
 
-  if [ "${VERBOSE}" = "true" ]; then
-    ARGS+=(--verbose)
+  if [ "${verbose}" = "true" ]; then
+    args+=(--verbose)
   fi
 fi
 
-# Run with timing; tee output so the approval token can be captured
-echo "--- :rocket: fjall ${ARGS[*]}"
-cd -- "${WORKING_DIR}"
+# The deploy token comes from the environment when that supplies it, else
+# from Buildkite's secret store (`buildkite-agent secret get` reads the
+# pipeline's FJALL_API_KEY secret), fetched here, once every property is
+# checked, so that a missing secret fails before any download. The CLI reads
+# FJALL_API_KEY before stored credentials.
+if [ -z "${FJALL_API_KEY:-}" ] && command -v buildkite-agent > /dev/null 2>&1; then
+  echo "--- :key: Fetching FJALL_API_KEY from Buildkite secrets"
+  FJALL_API_KEY="$(buildkite-agent secret get FJALL_API_KEY)"
+fi
 
-LOG_FILE="$(mktemp)"
-START=$(date +%s)
+# Bootstrap Node when the agent's runtime is below the wrapper's floor (or
+# absent). Fetch the pinned build, verify its SHA-256 before extracting, and
+# prepend it to PATH so `npm`/`fjall` resolve to it. A digest mismatch aborts
+# under `set -e` rather than executing an unverified binary.
+node_agent_version="0.0.0"
+if command -v node > /dev/null 2>&1; then
+  node_agent_version="$(node --version 2>/dev/null || echo v0.0.0)"
+  node_agent_version="${node_agent_version#v}"
+fi
+node_agent_version="${node_agent_version:-0.0.0}"
+# Compare the FULL version, not the major: an agent on 22.3.0 passes a
+# `-lt 22` test and still cannot run the CLI. `sort -V` orders versions and is
+# present on GNU coreutils, macOS and busybox; the lower of the pair is the
+# agent's exactly when the agent is below the floor. The first line is taken by
+# expansion rather than `| head -n 1`: head exits on the first line, and the
+# SIGPIPE that lands on sort fails the whole substitution under `pipefail`.
+node_sorted="$(printf '%s\n%s\n' "${node_agent_version}" "${node_floor}" | sort -V)"
+node_lowest="${node_sorted%%$'\n'*}"
+if [ "${node_agent_version}" != "${node_floor}" ] && [ "${node_lowest}" = "${node_agent_version}" ]; then
+  # The pinned builds are Linux tarballs, and `uname -m` spells arm64 the same
+  # on macOS: without this, a macOS agent would put a Linux ELF first on PATH
+  # and die at `npm install` with an exec-format error that names nothing.
+  node_os="$(uname -s)"
+  if [ "${node_os}" != "Linux" ]; then
+    echo "^^^ +++"
+    echo "Error: agent node ${node_agent_version} is below ${node_floor}, and the Node bootstrap installs Linux builds only (this agent runs ${node_os}); install Node >= ${node_floor} on the agent."
+    exit 1
+  fi
+  echo "--- :node: Bootstrapping Node ${node_version} (agent node: ${node_agent_version}, floor: ${node_floor})"
+  case "$(uname -m)" in
+    x86_64 | amd64) node_arch="x64"; node_sha256="${node_sha256_x64}" ;;
+    aarch64 | arm64) node_arch="arm64"; node_sha256="${node_sha256_arm64}" ;;
+    *)
+      echo "^^^ +++"
+      echo "Error: unsupported architecture '$(uname -m)' for Node bootstrap; install Node >= ${node_floor} on the agent."
+      exit 1
+      ;;
+  esac
+  node_dist="node-v${node_version}-linux-${node_arch}"
+  node_tarball="${node_dist}.tar.xz"
+  node_tmp="$(mktemp -d)"
+  # Reap the extracted tree on exit — including a set -e abort at the digest
+  # gate — so a persistent self-hosted agent does not accumulate a Node tree per
+  # build. Armed only once the dir exists, so the earlier exits never fire it.
+  trap 'rm -rf "${node_tmp:-}"' EXIT
+  # The download is bounded, as Fjall's own CI bounds the same one: a transfer
+  # that stalls below 1 KB/s for a minute is cut and retried, with curl's
+  # backoff, as is a transient failure; no attempt outlives --max-time, and
+  # none starts past --retry-max-time. The limits are a customer agent's, whose
+  # network may be slower than Fjall's, and stay well inside a deploy step's
+  # timeout.
+  curl -fsSL --connect-timeout 20 --speed-limit 1024 --speed-time 60 --max-time 600 --retry 2 --retry-max-time 300 \
+    -o "${node_tmp}/${node_tarball}" "https://nodejs.org/dist/v${node_version}/${node_tarball}"
+  if command -v sha256sum > /dev/null 2>&1; then
+    echo "${node_sha256}  ${node_tmp}/${node_tarball}" | sha256sum -c -
+  else
+    echo "${node_sha256}  ${node_tmp}/${node_tarball}" | shasum -a 256 -c -
+  fi
+  tar -xJf "${node_tmp}/${node_tarball}" -C "${node_tmp}"
+  export PATH="${node_tmp}/${node_dist}/bin:${PATH}"
+  echo "Bootstrapped Node ${node_version}"
+fi
+
+# npm, the engine resolver, the version check and the supersede check run
+# without the job token, which could fetch the deploy token again, and
+# without the AWS keys a step's environment may carry.
+install_step() {
+  (
+    unset BUILDKITE_AGENT_ACCESS_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    "$@"
+  )
+}
+
+plugin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Skip this deploy when a newer deploy build already carries its commit. The
+# decision is supersede-check.mjs's, and only its positive proof skips. Every
+# other outcome falls through to the deploy. The module runs through
+# install_step, so it never holds the deploy token, and it takes the read
+# token on stdin, never argv or env.
+if [ "${supersede}" = "true" ]; then
+  echo "--- :fast_forward: Checking for a newer deploy that carries this commit"
+  if [ -n "${BUILDKITE_REBUILT_FROM_BUILD_NUMBER:-}" ]; then
+    echo "supersede: deploying, a rebuild never skips"
+  elif ! command -v buildkite-agent > /dev/null 2>&1; then
+    echo "supersede: deploying, buildkite-agent is not on this agent's PATH"
+  elif ! supersede_token="$(buildkite-agent secret get "${supersede_token_secret}")" || [ -z "${supersede_token}" ]; then
+    echo "supersede: deploying, the supersede.token-secret secret could not be read"
+  else
+    set +e
+    supersede_line="$(printf '%s' "${supersede_token}" | install_step node "${plugin_dir}/supersede-check.mjs" "${supersede_after}" ${supersede_barriers[@]+"${supersede_barriers[@]}"})"
+    supersede_status=$?
+    set -e
+    supersede_token=""
+    echo "${supersede_line}"
+    skip_line_pattern='^supersede: skipped for #([1-9][0-9]*) at ([0-9a-f]{40})$'
+    if [ "${supersede_status}" -eq 10 ] && [[ "${supersede_line}" =~ ${skip_line_pattern} ]]; then
+      newer_number="${BASH_REMATCH[1]}"
+      newer_commit="${BASH_REMATCH[2]}"
+      # The result is written first, and a skip that cannot record it deploys.
+      # A build that deployed nothing with no `superseded` on it would send its
+      # readers looking for a deploy of this commit that never happens.
+      # `meta-data set` writes to the build of `--job`, which defaults to
+      # BUILDKITE_JOB_ID, a standard variable a build's env cannot override.
+      # Unlike `get` it has no `--build`, so adding one would fail this write
+      # and turn every skip into a deploy.
+      if buildkite-agent meta-data set "fjall-deploy:result" "superseded"; then
+        buildkite-agent meta-data set "fjall-deploy:superseded-by" "${newer_number}" || true
+        newer_build="#${newer_number}"
+        if [ -n "${BUILDKITE_BUILD_URL:-}" ]; then
+          newer_build="[#${newer_number}](${BUILDKITE_BUILD_URL%/*}/${newer_number})"
+        fi
+        own_commit="${BUILDKITE_COMMIT:-}"
+        buildkite-agent annotate --style warning --context fjall-deploy-superseded \
+          "This build deployed nothing. Build ${newer_build}, at \`${newer_commit:0:9}\`, is newer, has passed its \`${supersede_after}\` step and carries this build's commit \`${own_commit:0:9}\`, so its deploy covers this one." || true
+        exit 0
+      fi
+      echo "supersede: deploying, the result superseded could not be recorded"
+    elif [ "${supersede_status}" -ne 0 ]; then
+      echo "supersede: deploying, the check exited ${supersede_status}"
+    fi
+  fi
+fi
+
+# Install the CLI. No package's lifecycle script runs: the CLI's dependency
+# tree is resolved afresh on every install, and an install script is the usual
+# way a compromised release reads the environment it runs in. In the trees
+# the latest releases of fjall majors 10, 15, 20, 25 and 29 to 39 resolve to
+# (measured on macOS, 2026-10-08), the packages that declare one, esbuild
+# (its binary-path optimisation) and fsevents (macOS only, prebuilt), work
+# without it, provided npm installs optional dependencies, as it does by
+# default: esbuild's binary is one.
+echo "--- :package: Installing fjall"
+if [ "${cli_version}" = "latest" ]; then
+  install_step npm install -g --ignore-scripts fjall
+elif [ "${cli_version}" = "auto" ]; then
+  # Match the engine major to the app's pinned @fjall/components-infrastructure
+  # so the deploy engine never skews across a major from the constructs it
+  # synthesises (engine-version contract). The resolver ships alongside this
+  # hook; working_dir reaches it via argv, never interpolated into the shell.
+  # Kept byte-identical to the GitHub Action's resolver (parity test locks it).
+  if ! resolved_engine_spec="$(install_step node "${plugin_dir}/resolve-fjall-engine.mjs" "${working_dir}")"; then
+    echo "Failed to resolve the fjall engine from the app's @fjall/components-infrastructure pin" >&2
+    exit 1
+  fi
+  # An exit status is not an answer. The resolver prints one line and exits 0;
+  # a status-only check reads a silent success as a spec and hands the empty
+  # string to npm, which installs something nobody chose on the lane whose
+  # whole purpose is to pick the right major. Emptiness is its own refusal.
+  if [ -z "${resolved_engine_spec}" ]; then
+    echo "The fjall engine resolver exited 0 without naming an engine — refusing to install an unnamed one" >&2
+    exit 1
+  fi
+  install_step npm install -g --ignore-scripts "${resolved_engine_spec}"
+else
+  install_step npm install -g --ignore-scripts "fjall@${cli_version}"
+fi
+echo "Installed $(install_step fjall --version)"
+
+# Run with timing; tee output so the approval token can be captured
+echo "--- :rocket: fjall ${args[*]}"
+cd -- "${working_dir}"
+
+# The one process the deploy token is handed to. Without one, the CLI falls
+# back to its stored credentials.
+run_cli() {
+  if [ -n "${FJALL_API_KEY:-}" ]; then
+    FJALL_API_KEY="${FJALL_API_KEY}" fjall "$@"
+  else
+    fjall "$@"
+  fi
+}
+
+log_file="$(mktemp)"
+start=$(date +%s)
 
 set +e
-fjall "${ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
-EXIT_CODE=${PIPESTATUS[0]}
+run_cli "${args[@]}" 2>&1 | tee "${log_file}"
+exit_code=${PIPESTATUS[0]}
 set -e
 
-END=$(date +%s)
-DURATION=$((END - START))
+end=$(date +%s)
+duration=$((end - start))
 
 # The CLI prints "Approval token: <token>" when a plan has pending changes
-TOKEN_LINE=$(grep -m1 '^Approval token: ' "${LOG_FILE}" || true)
-rm -f "${LOG_FILE}"
+token_line=$(grep -m1 '^Approval token: ' "${log_file}" || true)
+rm -f "${log_file}"
 
-# Exit 2 = plan computed with changes pending approval, or refused at the
-# approval gate — no mutation happened. Classify like the GitHub Action's
-# `result` output; buildkite-agent is absent in local/bats runs, so guard.
-if [ "${EXIT_CODE}" -eq 0 ]; then
-  RESULT="success"
-elif [ "${EXIT_CODE}" -eq 2 ]; then
-  RESULT="plan-pending"
+# Exit 2 = the run stopped without failing: a plan with changes pending
+# approval, a plan refused at the approval gate, or a run cancelled before it
+# completed, which can stop after applying part of its change. The exit code
+# does not say which; only a pending plan prints an approval token. Classify
+# like the GitHub Action's `result` output; buildkite-agent is absent in
+# local/bats runs, so guard.
+if [ "${exit_code}" -eq 0 ]; then
+  result="success"
+elif [ "${exit_code}" -eq 2 ]; then
+  result="plan-pending"
 else
-  RESULT="failure"
+  result="failure"
 fi
 
 if command -v buildkite-agent > /dev/null 2>&1; then
   # Best-effort reporting under set -e — a transient agent failure after a
   # successful deploy must not replace the deploy's real exit status.
-  buildkite-agent meta-data set "fjall-deploy:result" "${RESULT}" || true
-  buildkite-agent meta-data set "fjall-deploy:duration" "${DURATION}" || true
-  if [ -n "${TOKEN_LINE}" ]; then
-    buildkite-agent meta-data set "fjall-deploy:approval-token" "${TOKEN_LINE#Approval token: }" || true
+  buildkite-agent meta-data set "fjall-deploy:result" "${result}" || true
+  buildkite-agent meta-data set "fjall-deploy:duration" "${duration}" || true
+  if [ -n "${token_line}" ]; then
+    buildkite-agent meta-data set "fjall-deploy:approval-token" "${token_line#Approval token: }" || true
   fi
-  if [ "${RESULT}" = "plan-pending" ]; then
+  if [ "${result}" = "plan-pending" ] && [ -n "${token_line}" ]; then
     buildkite-agent annotate --style warning \
-      "Fjall plan for **${TARGET}** has changes pending approval. Re-run with the \`approval-token\` property set to the \`fjall-deploy:approval-token\` meta-data value to apply." || true
+      "Fjall plan for **${target}** has changes pending approval. Re-run with the \`approval-token\` property set to the \`fjall-deploy:approval-token\` meta-data value to apply." || true
+  elif [ "${result}" = "plan-pending" ]; then
+    buildkite-agent annotate --style warning \
+      "Fjall stopped **${target}** before it completed: the approval gate refused the plan, or the run was cancelled. A cancelled run can stop after applying part of its change; the step log says which." || true
   fi
 fi
 
-if [ "${EXIT_CODE}" -ne 0 ]; then
-  exit "${EXIT_CODE}"
-fi
+exit "${exit_code}"

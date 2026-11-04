@@ -3,7 +3,7 @@
 # The hook's pins are READ here, never restated. A literal copy in this file
 # rots silently — a hardcoded CLI major survived two majors before this suite
 # first ran in CI — and the Node pins rot worse than the major did: a raised
-# NODE_FLOOR turns the "compatible agent" stub below into a below-floor one,
+# node_floor turns the "compatible agent" stub below into a below-floor one,
 # so every default-path test starts down the bootstrap branch it was written
 # to skip. An unreadable pin is a failure, not a default: an empty value would
 # stub `v` as the agent's version and every assertion after it would be
@@ -18,44 +18,306 @@ read_hook_pin() {
   printf '%s' "$value"
 }
 
+# The properties plugin.yml declares with one type, one name per line. The
+# table tests walk these lists rather than a list of their own, so a property
+# added to the manifest joins every test that covers its type. An empty list
+# is a failure, not a pass over nothing.
+properties_of_type() {
+  local names
+  names="$(awk -v type="$1" '
+    /^    [a-z-]+:$/ { name = substr($1, 1, length($1) - 1) }
+    /^      type: / && $2 == type { print name }
+  ' "$PWD/plugin.yml")"
+  [ -n "$names" ] || {
+    echo "could not read any $1 property from plugin.yml" >&2
+    return 1
+  }
+  printf '%s\n' "$names"
+}
+
+# The properties plugin.yml neither requires nor gives a default (`without`),
+# or the ones it does (`with`), one name per line: `-` means none for the
+# first, which have no value of their own, and for no other.
+properties_by_own_value() {
+  local names
+  names="$(awk -v want="$1" '
+    /^    [a-z-]+:$/ { name = substr($1, 1, length($1) - 1); order[++count] = name }
+    /^      default: / { defaulted[name] = 1 }
+    /^  required:$/ { in_required = 1; next }
+    in_required && /^    - / { required[$2] = 1 }
+    END {
+      for (i = 1; i <= count; i++) {
+        own = (order[i] in defaulted) || (order[i] in required)
+        if (own == (want == "with")) print order[i]
+      }
+    }
+  ' "$PWD/plugin.yml")"
+  [ -n "$names" ] || {
+    echo "could not read any property $1 a value of its own from plugin.yml" >&2
+    return 1
+  }
+  printf '%s\n' "$names"
+}
+
+# The environment variable the hook reads a property from.
+property_env() {
+  printf 'BUILDKITE_PLUGIN_FJALL_DEPLOY_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
+}
+
+# A stub's command that names each credential it was handed, never a value,
+# as "<tool> holds <NAME>".
+credential_report() {
+  printf 'for name in FJALL_API_KEY BUILDKITE_AGENT_ACCESS_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do if [ -n "${!name-}" ]; then echo "%s holds ${name}"; fi; done' "$1"
+}
+
+# The agent's node, npm and fjall, as one run of the hook calls them. npm and
+# the version check say which credentials reached them, and the CLI whether it
+# holds the deploy token the test expects (EXPECTED_DEPLOY_TOKEN); the CLI
+# also leaves the environment it was given in cli-env.
+stub_agent_tools() {
+  stub node "--version : echo 'v${HOOK_NODE_VERSION}'"
+  stub npm "install -g --ignore-scripts fjall@${FJALL_CLI_DEFAULT_MAJOR} : echo 'installed fjall@${FJALL_CLI_DEFAULT_MAJOR}'; $(credential_report npm)"
+
+  # The second plan line uses the `::` unconditional form — a bare `*` pattern
+  # only matches single-argument invocations in bats-mock v2.2.0, the release
+  # docker-compose.yml's image carries (extra arguments are rejected as
+  # unexpected). It prints the argv it was given behind a prefix the hook
+  # never prints: the hook's own header line (`--- :rocket: fjall …`) carries
+  # the same words, so an assertion on those words alone passes with the CLI
+  # never called.
+  stub fjall \
+    "--version : echo 'fjall/0.88.3'; $(credential_report 'fjall --version')" \
+    ":: echo \"cli received: \$*\"; if [ -n \"\${FJALL_API_KEY-}\" ] && [ \"\${FJALL_API_KEY}\" = \"\${EXPECTED_DEPLOY_TOKEN-}\" ]; then echo 'cli holds the deploy token'; fi; $(credential_report cli); env > '${BATS_TEST_TMPDIR}/cli-env'"
+}
+
+# The bootstrap's doubles for an agent whose `uname -m` reads $1 and whose
+# tarballs nodejs.org names $2 (x64 or arm64): curl answers only the bounded
+# download of the hook's version, sha256sum only the hook's digest for that
+# architecture against that tarball, and tar unpacks a Node whose npm says it
+# ran, so a test can tell the bootstrapped toolchain from the agent's.
+stub_node_bootstrap() {
+  local machine="$1" arch="$2" digest dist
+  digest="$(read_hook_pin "node_sha256_${arch}")"
+  dist="node-v${HOOK_NODE_VERSION}-linux-${arch}"
+  printf '#!/usr/bin/env bash\necho "bootstrapped npm ran: $*"\n' > "$BATS_TEST_TMPDIR/bootstrapped-npm"
+  chmod +x "$BATS_TEST_TMPDIR/bootstrapped-npm"
+  stub uname "-s : echo 'Linux'" "-m : echo '${machine}'"
+  stub curl "-fsSL --connect-timeout 20 --speed-limit 1024 --speed-time 60 --max-time 600 --retry 2 --retry-max-time 300 -o * https://nodejs.org/dist/v${HOOK_NODE_VERSION}/${dist}.tar.xz : true"
+  stub sha256sum "-c - : read -r digest file; [ \"\${digest}\" = '${digest}' ] && [ \"\${file##*/}\" = '${dist}.tar.xz' ] && echo 'sha256sum checked the pinned ${arch} digest'"
+  stub tar "-xJf * -C * : mkdir -p \"\$4/${dist}/bin\" && cp '$BATS_TEST_TMPDIR/bootstrapped-npm' \"\$4/${dist}/bin/npm\""
+}
+
+# Runs the hook through a copy of the wrapper agent v3.138.0 runs a shell
+# hook in (internal/job/hook/wrapper.go): it dumps the environment, sources
+# the hook, records the hook's exit status and working directory, and dumps
+# the environment again. When the hook exits 0, the agent carries the
+# difference, and that directory, into the rest of the job. The dumps are
+# left in env-before and env-after, sorted, with `env` standing in for
+# `buildkite-agent env dump`.
+run_hook_through_agent_wrapper() {
+  printf '%s\n' \
+    'env | sort > "${HOOK_ENV_BEFORE}"' \
+    '. "${HOOK_UNDER_TEST}"' \
+    'export BUILDKITE_HOOK_EXIT_STATUS=$?' \
+    'export BUILDKITE_HOOK_WORKING_DIR="${PWD}"' \
+    'env | sort > "${HOOK_ENV_AFTER}"' \
+    'exit "${BUILDKITE_HOOK_EXIT_STATUS}"' > "$BATS_TEST_TMPDIR/hook-wrapper"
+  export HOOK_UNDER_TEST="$PWD/hooks/command"
+  export HOOK_ENV_BEFORE="$BATS_TEST_TMPDIR/env-before"
+  export HOOK_ENV_AFTER="$BATS_TEST_TMPDIR/env-after"
+  run bash "$BATS_TEST_TMPDIR/hook-wrapper"
+}
+
+# Writes a shim into TOKEN_SHIMS for each command named, which says on
+# stderr when a variable in its environment holds the deploy token the test
+# expects (EXPECTED_DEPLOY_TOKEN itself aside), as "<command> <first
+# argument> holds the deploy token", and then runs the command it stands in
+# for. It reads its environment with builtins alone, and speaks only for a
+# process the hook started itself: it marks what it runs, so the processes a
+# stub starts for its own bookkeeping, inside the CLI's stub included, stay
+# quiet. A test puts the shims first on PATH for its run of the hook alone
+# (`PATH="${TOKEN_SHIMS}:${PATH}" run …`), so the commands bats runs after
+# the test never meet them.
+shim_reporting_the_token() {
+  local shims="$BATS_TEST_TMPDIR/shims" command real
+  TOKEN_SHIMS="$shims"
+  mkdir -p "$shims"
+  for command in "$@"; do
+    real="$(command -v "$command")"
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'if [ -z "${STARTED_BY_A_SHIM-}" ]; then' \
+      '  for name in $(compgen -e); do' \
+      '    if [ "${name}" != EXPECTED_DEPLOY_TOKEN ] && [[ "${!name}" == *"${EXPECTED_DEPLOY_TOKEN}"* ]]; then' \
+      "      echo \"${command} \${1-} holds the deploy token\" >&2" \
+      '      break' \
+      '    fi' \
+      '  done' \
+      'fi' \
+      'export STARTED_BY_A_SHIM=1' \
+      "exec '${real}' \"\$@\"" > "$shims/$command"
+    chmod +x "$shims/$command"
+  done
+}
+
+# Every name the hook once gave a variable of its own, in upper case, and
+# DEPLOY_TOKEN, which it once held the token under: names a job may export
+# for itself, NODE_VERSION among them in the official node images.
+FORMER_HOOK_NAMES="COMMAND TARGET SERVICE MODE ENVIRONMENT DEPLOY_TARGET VERBOSE SKIP_BUILD NO_CASCADE REGION IMAGE_TAG PLAN REQUIRE_APPROVAL AUTO_APPROVE APPROVAL_TOKEN CLI_VERSION WORKING_DIR FORCE NOT_REPEATED TIER_NOUN INCOMPATIBLE ARGS PLUGIN_DIR RESOLVED_ENGINE_SPEC LOG_FILE START EXIT_CODE END DURATION TOKEN_LINE RESULT FJALL_CLI_DEFAULT_MAJOR NODE_FLOOR NODE_VERSION NODE_SHA256_X64 NODE_SHA256_ARM64 NODE_AGENT_VERSION NODE_SORTED NODE_LOWEST NODE_OS NODE_ARCH NODE_SHA256 NODE_DIST NODE_TARBALL NODE_TMP DEPLOY_TOKEN SUPERSEDE SUPERSEDE_AFTER SUPERSEDE_TOKEN_SECRET SUPERSEDE_BARRIERS SUPERSEDE_BARRIER_NAMES SUPERSEDE_TOKEN SUPERSEDE_LINE SUPERSEDE_STATUS SKIP_LINE_PATTERN NEWER_NUMBER NEWER_COMMIT NEWER_BUILD OWN_COMMIT"
+
+# The job exports each of those names with a value of its own.
+export_former_hook_names() {
+  local name
+  for name in ${FORMER_HOOK_NAMES}; do
+    export "${name}=the job's ${name}"
+  done
+}
+
+# The CLI was given each of those names with the job's value.
+assert_cli_was_given_the_job_values() {
+  local name
+  for name in ${FORMER_HOOK_NAMES}; do
+    run grep -Fx "${name}=the job's ${name}" "$BATS_TEST_TMPDIR/cli-env"
+    assert_success
+  done
+}
+
+# Every variable name a bash script sets, one per line, as its text shows
+# them, in the forms this hook writes. A line whose first non-blank
+# character is # is skipped, however it ends, unless it continues the line
+# before; any other line that ends in an odd number of backslashes is joined
+# to the next. Each line then gives: an assignment (NAME=, NAME+=, NAME[…]=), a
+# command's prefix assignment included; the name given to printf -v; the
+# names given to read while each option that takes an argument is a word of
+# its own; the variable of a for … in loop; the names given to local,
+# declare, typeset, readonly or export; and every word of every for list
+# over a variable that printf -v is given as "${var}" or "$var".
+#
+# It reads text rather than parsing it. A name set in any other form goes
+# unseen: ${NAME:=…}; an arithmetic assignment not spelled NAME= or NAME+=
+# ((( NAME = 0 )), (( NAME++ )), let NAME++); mapfile and readarray; a read
+# whose options are grouped before an option argument (read -rd '' NAME),
+# or whose option argument holds a space; getopts, select and coproc; a for
+# loop with no in list; a nameref's target; a name written in quotes, but
+# printf -v's; a word a for list takes from an expansion; and a name made at
+# run time other than through such a for list (export "${name}=…", eval,
+# printf -v "$1"). The hook uses none of those forms. A word that only looks
+# like a form it reads, in a string, a trailing comment, a heredoc or a
+# declaration that only prints a name (declare -p NAME), can be read as a
+# name, so an upper-case one there fails the test it feeds, never passes it.
+variables_set_in() {
+  awk '
+    BEGIN { quote = sprintf("%c", 39) }
+    held == "" && /^[[:space:]]*#/ { next }
+    {
+      line = held $0
+      held = ""
+      if (match(line, /\\+$/) && RLENGTH % 2 == 1) {
+        held = substr(line, 1, length(line) - 1)
+        next
+      }
+      rest = line
+      while (match(rest, /(^|[^A-Za-z0-9_$-])[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?[+]?=/)) {
+        name = substr(rest, RSTART, RLENGTH)
+        sub(/^[^A-Za-z_]/, "", name)
+        sub(/(\[[^]]*\])?[+]?=$/, "", name)
+        print name
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      count = split(line, word, /[[:space:];&|()]+/)
+      for (i = 1; i <= count; i++) {
+        if (word[i] == "printf" && word[i + 1] == "-v") {
+          target = word[i + 2]
+          gsub(/"/, "", target)
+          gsub(quote, "", target)
+          if (target ~ /^[$]/) {
+            gsub(/[${}]/, "", target)
+            indirect[target] = 1
+          } else {
+            print target
+          }
+        } else if (word[i] == "read") {
+          for (j = i + 1; j <= count; j++) {
+            if (word[j] == "-a") { print word[j + 1]; j++; continue }
+            if (word[j] ~ /^-[dinNptu]$/) { j++; continue }
+            if (word[j] ~ /^-/) continue
+            if (word[j] ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print word[j]
+            else break
+          }
+        } else if (word[i] == "for" && word[i + 2] == "in") {
+          print word[i + 1]
+          list = ""
+          for (j = i + 3; j <= count && word[j] != "do"; j++) list = list " " word[j]
+          loop[word[i + 1]] = loop[word[i + 1]] list
+        } else if (word[i] ~ /^(local|declare|typeset|readonly|export)$/) {
+          for (j = i + 1; j <= count; j++) {
+            if (word[j] ~ /^[-+]/) continue
+            target = word[j]
+            sub(/=.*/, "", target)
+            if (target ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print target
+            else break
+          }
+        }
+      }
+    }
+    END {
+      for (target in indirect) {
+        count = split(loop[target], word, " ")
+        for (k = 1; k <= count; k++) print word[k]
+      }
+    }
+  ' "$1"
+}
+
+# The deploy token left to the secret store, as on an agent whose
+# environment does not export it: the hook then fetches it, and says so,
+# so a walk that refutes the fetch fails if a check comes after it.
+token_left_to_secret_store() {
+  unset FJALL_API_KEY
+  stub buildkite-agent "secret get FJALL_API_KEY : echo 'fjall_dk_fetched'"
+}
+
+# A plan answers one run of the hook, so a test that runs it again past its
+# input guards puts the plans back first.
+restub_agent_tools() {
+  unstub node || true
+  unstub npm || true
+  unstub fjall || true
+  stub_agent_tools
+}
+
 setup() {
   load "$BATS_PLUGIN_PATH/load.bash"
 
   # The hook fetches FJALL_API_KEY from Buildkite secrets only when the
   # environment lacks it; pre-set it so the default path never calls
-  # `buildkite-agent secret get`. The dedicated secret-fetch test unsets it.
+  # `buildkite-agent secret get`. The secret-fetch tests unset it, and so do
+  # the walks that refute a fetch (token_left_to_secret_store).
   export FJALL_API_KEY="fjall_dk_bats"
 
-  # The hook bootstraps Node only when the agent's node is below NODE_FLOOR;
+  # The hook bootstraps Node only when the agent's node is below node_floor;
   # report a compatible node so the default path skips the curl/verify/extract
   # bootstrap. The Node-bootstrap tests drain-and-replace this with a
   # below-floor stub.
   #
   # The version reported is the one the hook itself installs, which the
-  # ci-plugin parity test proves clears NODE_FLOOR — so "compatible" here is a
+  # ci-plugin parity test proves clears node_floor — so "compatible" here is a
   # fact about the hook rather than a second literal to keep in step with it.
   # Plain assignments, deliberately: `export X="$(cmd)"` and `local X="$(cmd)"`
   # take the BUILTIN's exit status, so the reader's refusal would be swallowed
   # and setup would carry on with an empty pin. setup() and the test body share
   # a shell, so there is nothing to export for.
-  HOOK_NODE_VERSION="$(read_hook_pin NODE_VERSION)"
-  HOOK_NODE_FLOOR="$(read_hook_pin NODE_FLOOR)"
-  stub node "--version : echo 'v${HOOK_NODE_VERSION}'"
+  HOOK_NODE_VERSION="$(read_hook_pin node_version)"
+  HOOK_NODE_FLOOR="$(read_hook_pin node_floor)"
 
-  # Create a stub for npm. With no cli-version set, the hook defaults to
-  # FJALL_CLI_DEFAULT_MAJOR (design § 5.2 version tie), so the default install
+  # With no cli-version set, the hook defaults to fjall_cli_default_major
+  # (design § 5.2 version tie), so the default install the npm stub answers
   # is `fjall@<that major>`, not bare `fjall`. Derived from the hook rather
   # than restated: a hardcoded major here silently rotted across two CLI
   # majors before this suite first ran in CI.
-  FJALL_CLI_DEFAULT_MAJOR="$(read_hook_pin FJALL_CLI_DEFAULT_MAJOR)"
-  stub npm "install -g fjall@${FJALL_CLI_DEFAULT_MAJOR} : echo 'installed fjall@${FJALL_CLI_DEFAULT_MAJOR}'"
+  FJALL_CLI_DEFAULT_MAJOR="$(read_hook_pin fjall_cli_default_major)"
 
-  # Create a stub for fjall. The second plan line uses the `::` unconditional
-  # form — a bare `*` pattern only matches single-argument invocations in
-  # current bats-mock (extra arguments are rejected as unexpected).
-  stub fjall \
-    "--version : echo 'fjall/0.88.3'" \
-    ":: echo \"fjall \$@\""
+  stub_agent_tools
 }
 
 teardown() {
@@ -78,7 +340,8 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+  assert_line "installed fjall@${FJALL_CLI_DEFAULT_MAJOR}"
+  assert_line "cli received: ci run deploy my-app --non-interactive"
 }
 
 @test "Deploys with infra-only mode" {
@@ -88,7 +351,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run deploy my-app --non-interactive --mode infra-only"
+  assert_line "cli received: ci run deploy my-app --non-interactive --mode infra-only"
 }
 
 @test "Deploys with deploy-only mode" {
@@ -98,7 +361,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run deploy my-app --non-interactive --mode deploy-only"
+  assert_line "cli received: ci run deploy my-app --non-interactive --mode deploy-only"
 }
 
 @test "Deploys with verbose flag" {
@@ -108,7 +371,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "--verbose"
+  assert_line "cli received: ci run deploy my-app --non-interactive --verbose"
 }
 
 @test "Deploys with environment flag" {
@@ -118,7 +381,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "--environment staging"
+  assert_line "cli received: ci run deploy my-app --non-interactive --environment staging"
 }
 
 @test "Deploys with skip-build flag" {
@@ -128,7 +391,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "--skip-build"
+  assert_line "cli received: ci run deploy my-app --non-interactive --skip-build"
 }
 
 # T3: the tier words are noun-verb. A tier target routes to `fjall <noun>
@@ -144,7 +407,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall org deploy --non-interactive --verbose"
+  assert_line "cli received: org deploy --non-interactive --verbose"
   refute_output --partial "ci run"
 }
 
@@ -155,7 +418,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall org deploy --non-interactive --no-cascade"
+  assert_line "cli received: org deploy --non-interactive --no-cascade"
 }
 
 @test "platform target routes to the noun-verb platform deploy" {
@@ -164,7 +427,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall platform deploy --non-interactive"
+  assert_line "cli received: platform deploy --non-interactive"
   refute_output --partial "ci run"
 }
 
@@ -176,7 +439,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall account destroy --non-interactive --force"
+  assert_line "cli received: account destroy --non-interactive --force"
 }
 
 @test "no-cascade with an app target is rejected (cascade is organisation-only)" {
@@ -199,15 +462,40 @@ teardown() {
   assert_output --partial "only valid with target: organisation"
 }
 
-@test "an app/deploy-only property with a tier target is rejected, not dropped" {
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="organisation"
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_PLAN="true"
+# The properties are plugin.yml's, less the ones a tier target takes: the two
+# positionals, the flags a tier leaf honours, and the two the hook consumes
+# itself. A property added to the manifest is therefore refused beside a tier
+# target, or named here as one a tier honours. The refusal comes before the
+# install, so no run consumes a plan.
+@test "every application-only property is refused with a tier target, not dropped" {
+  local type properties property env_name value
+  for type in string boolean array; do
+    properties="$(properties_of_type "${type}")"
+    for property in ${properties}; do
+      case "${property}" in
+        command | target | force | verbose | no-cascade | cli-version | working-directory) continue ;;
+      esac
+      env_name="$(property_env "${property}")"
+      case "${type}" in
+        boolean) value="true" ;;
+        array)
+          env_name="${env_name}_0"
+          value="item"
+          ;;
+        # A value `mode` does not read as its default.
+        *) value="infra-only" ;;
+      esac
 
-  run "$PWD/hooks/command"
+      export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="organisation"
+      export "${env_name}=${value}"
+      run "$PWD/hooks/command"
+      unset "${env_name}"
 
-  assert_failure
-  assert_output --partial "not valid with tier target 'organisation'"
-  assert_output --partial "plan"
+      assert_failure
+      assert_output --partial "not valid with tier target 'organisation': ${property}."
+      refute_output --partial "Installing fjall"
+    done
+  done
 }
 
 @test "build is application-only: a tier build target is rejected" {
@@ -220,6 +508,19 @@ teardown() {
   assert_output --partial "application-only"
 }
 
+# A refusal names the rule, never the value it refused.
+@test "a command a tier target does not take is refused without repeating it" {
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND="deplyo"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="platform"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "tier target 'platform' supports the commands deploy and destroy only"
+  refute_output --partial "deplyo"
+  refute_output --partial "cli received:"
+}
+
 @test "Deploys with region and image-tag" {
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_REGION="eu-west-1"
@@ -228,8 +529,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "--region eu-west-1"
-  assert_output --partial "--image-tag abc123"
+  assert_line "cli received: ci run deploy my-app --non-interactive --region eu-west-1 --image-tag abc123"
 }
 
 @test "Deploys with plan and approval flags" {
@@ -241,9 +541,18 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "--plan"
-  assert_output --partial "--require-approval"
-  assert_output --partial "--approval-token tok-1"
+  assert_line "cli received: ci run deploy my-app --non-interactive --plan --require-approval --approval-token tok-1"
+}
+
+@test "Deploys with auto-approve past the approval gate" {
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_REQUIRE_APPROVAL="true"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_AUTO_APPROVE="true"
+
+  run "$PWD/hooks/command"
+
+  assert_success
+  assert_line "cli received: ci run deploy my-app --non-interactive --require-approval --auto-approve"
 }
 
 @test "Deploys with indexed build-args and build-secrets arrays" {
@@ -255,9 +564,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "--build-arg A=1"
-  assert_output --partial "--build-arg B=2"
-  assert_output --partial "--build-secret id=x,ssm=/p"
+  assert_line "cli received: ci run deploy my-app --non-interactive --build-arg A=1 --build-arg B=2 --build-secret id=x,ssm=/p"
 }
 
 @test "Deploys with specific service via --service" {
@@ -267,7 +574,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run deploy my-app --service api --non-interactive"
+  assert_line "cli received: ci run deploy my-app --service api --non-interactive"
 }
 
 @test "Destroys with force flag" {
@@ -278,7 +585,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run destroy my-app --non-interactive --force"
+  assert_line "cli received: ci run destroy my-app --non-interactive --force"
 }
 
 @test "Build command routes through ci run" {
@@ -288,14 +595,14 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run build my-app --non-interactive"
+  assert_line "cli received: ci run build my-app --non-interactive"
   refute_output --partial "--skip-confirmation"
 }
 
 @test "Installs pinned CLI version" {
   # setup()'s npm plan is unconsumed at this point, so unstub reports failure
   unstub npm || true
-  stub npm "install -g fjall@1.0.0 : echo 'installed fjall@1.0.0'"
+  stub npm "install -g --ignore-scripts fjall@1.0.0 : echo 'installed fjall@1.0.0'"
 
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_CLI_VERSION="1.0.0"
@@ -304,6 +611,39 @@ teardown() {
 
   assert_success
   assert_output --partial "installed fjall@1.0.0"
+}
+
+@test "cli-version latest installs the package with no version" {
+  unstub npm || true
+  stub npm "install -g --ignore-scripts fjall : echo 'installed fjall, unpinned'"
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_CLI_VERSION="latest"
+
+  run "$PWD/hooks/command"
+
+  assert_success
+  assert_line "installed fjall, unpinned"
+}
+
+# The CLI reads fjall-config.json from where it runs, so the stub reports
+# where that was.
+@test "runs the CLI in the working directory" {
+  fjall --version >/dev/null
+  fjall drain-remaining-plan-line >/dev/null
+  unstub fjall
+  stub fjall \
+    "--version : echo 'fjall/0.88.3'" \
+    ":: echo \"cli ran in \$PWD\""
+  mkdir -p "$BATS_TEST_TMPDIR/app"
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_WORKING_DIRECTORY="$BATS_TEST_TMPDIR/app"
+
+  run "$PWD/hooks/command"
+
+  assert_success
+  assert_line "cli ran in $BATS_TEST_TMPDIR/app"
 }
 
 # L0a (engine-version contract) — `cli-version: auto` resolves the engine major
@@ -316,18 +656,25 @@ teardown() {
   # calls the auto path makes: the bootstrap `node --version` check, then the
   # `node <resolver> <workdir>` invocation. The second plan line uses the `::`
   # unconditional form so it matches the resolver's multi-arg invocation. Echo a
-  # major (7) that differs from the hook's FJALL_CLI_DEFAULT_MAJOR so the
+  # major (7) that differs from the hook's fjall_cli_default_major so the
   # assertion proves the resolver's output drove the install, not the fallback.
+  # The resolver also says, on stderr (its stdout is the spec), which
+  # credentials reached it: the job token and AWS keys the step carries must
+  # not.
   node --version > /dev/null
   unstub node
   stub node \
     "--version : echo 'v${HOOK_NODE_VERSION}'" \
-    ":: echo 'fjall@7'"
+    ":: echo 'fjall@7'; $(credential_report resolver) >&2"
+  export BUILDKITE_AGENT_ACCESS_TOKEN="job-token"
+  export AWS_ACCESS_KEY_ID="AKIAHOOKTEST"
+  export AWS_SECRET_ACCESS_KEY="secret-key"
+  export AWS_SESSION_TOKEN="session-token"
 
   # setup()'s npm plan expects the baked default major; the resolver echoed 7,
   # so drain and re-stub for the resolved spec.
   unstub npm || true
-  stub npm "install -g fjall@7 : echo 'installed fjall@7'"
+  stub npm "install -g --ignore-scripts fjall@7 : echo 'installed fjall@7'"
 
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_CLI_VERSION="auto"
@@ -336,7 +683,8 @@ teardown() {
 
   assert_success
   assert_output --partial "installed fjall@7"
-  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+  refute_output --partial "resolver holds"
+  assert_line "cli received: ci run deploy my-app --non-interactive"
 }
 
 # The resolver fails loud (non-zero exit) when it cannot determine a single
@@ -389,8 +737,6 @@ teardown() {
 }
 
 @test "Fails when target is missing" {
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET=""
-
   run "$PWD/hooks/command"
 
   assert_failure
@@ -407,7 +753,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run destroy my-app --non-interactive --mode infra-only"
+  assert_line "cli received: ci run destroy my-app --non-interactive --mode infra-only"
 }
 
 @test "Full deploy with all options" {
@@ -421,7 +767,7 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run deploy my-app --service api --non-interactive --mode deploy-only --environment production --skip-build --verbose"
+  assert_line "cli received: ci run deploy my-app --service api --non-interactive --mode deploy-only --environment production --skip-build --verbose"
 }
 
 # H1a — argv injection safety. A value carrying spaces / extra --flags must reach
@@ -500,7 +846,7 @@ teardown() {
     "meta-data set fjall-deploy:result plan-pending : true" \
     "meta-data set fjall-deploy:duration * : true" \
     "meta-data set fjall-deploy:approval-token tok-123 : true" \
-    "annotate --style warning * : true"
+    "annotate --style warning * : echo \"annotation: \$4\""
 
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_PLAN="true"
@@ -510,6 +856,34 @@ teardown() {
   # unstub asserts all four buildkite-agent calls happened with those args
   unstub buildkite-agent
   assert_failure 2
+  assert_output --partial "annotation: Fjall plan for **my-app** has changes pending approval. Re-run with the"
+}
+
+# Exit 2 also ends a run the approval gate refused, or one cancelled before it
+# completed, which can have applied part of its change. Neither prints an
+# approval token, so neither is told to re-run with one.
+@test "exit 2 without an approval token is not reported as a plan to re-run" {
+  fjall --version >/dev/null
+  fjall drain-remaining-plan-line >/dev/null
+  unstub fjall
+  stub fjall \
+    "--version : echo 'fjall/0.88.3'" \
+    "ci run destroy my-app --non-interactive : echo 'Destruction of my-app was cancelled before completion.'; exit 2"
+  stub buildkite-agent \
+    "meta-data set fjall-deploy:result plan-pending : true" \
+    "meta-data set fjall-deploy:duration * : true" \
+    "annotate --style warning * : echo \"annotation: \$4\""
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND="destroy"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  # unstub asserts the hook set no approval-token meta-data
+  unstub buildkite-agent
+  assert_failure 2
+  assert_output --partial "annotation: Fjall stopped **my-app** before it completed"
+  refute_output --partial "Re-run with the"
 }
 
 @test "a transient buildkite-agent failure does not overwrite a successful deploy" {
@@ -534,27 +908,15 @@ teardown() {
   run "$PWD/hooks/command"
 
   assert_success
-  assert_output --partial "fjall ci run deploy my-app --non-interactive --target production-use1"
-}
-
-# The tier path (org/platform/account) is noun-verb and has no --target; a
-# deploy-target with a tier target is rejected rather than silently dropped —
-# consistent with every other app-only property on the tier path.
-@test "deploy-target with a tier target is rejected, not dropped" {
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="organisation"
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_DEPLOY_TARGET="production-use1"
-
-  run "$PWD/hooks/command"
-
-  assert_failure
-  assert_output --partial "not valid with tier target 'organisation'"
-  assert_output --partial "deploy-target"
+  assert_line "cli received: ci run deploy my-app --non-interactive --target production-use1"
 }
 
 # L3 (design § 5.2) — the hook fetches FJALL_API_KEY from Buildkite's secret
 # store when the environment lacks it, so a pipeline need only store the secret.
+# The fetched token reaches the CLI and nothing before it, and is never printed.
 @test "fetches FJALL_API_KEY from Buildkite secrets when the environment lacks it" {
   unset FJALL_API_KEY
+  export EXPECTED_DEPLOY_TOKEN="fjall_dk_fetched"
   stub buildkite-agent \
     "secret get FJALL_API_KEY : echo 'fjall_dk_fetched'" \
     "meta-data set fjall-deploy:result success : true" \
@@ -567,22 +929,284 @@ teardown() {
   unstub buildkite-agent
   assert_success
   assert_output --partial "Fetching FJALL_API_KEY from Buildkite secrets"
-  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+  assert_line "cli received: ci run deploy my-app --non-interactive"
+  assert_line "cli holds the deploy token"
+  refute_output --partial "npm holds"
+  refute_output --partial "fjall --version holds"
+  refute_output --partial "fjall_dk_fetched"
 }
 
-# L3 (design § 5.2) — when the agent's node is below NODE_FLOOR the hook
+# A token the environment supplies is taken out of it too: the install, its
+# dependency tree's scripts included, never sees the deploy token, the job
+# token that could fetch it again, or the step's AWS keys. The CLI gets the
+# deploy token.
+@test "the deploy token reaches the CLI and nothing that runs before it" {
+  export EXPECTED_DEPLOY_TOKEN="${FJALL_API_KEY}"
+  export BUILDKITE_AGENT_ACCESS_TOKEN="job-token"
+  export AWS_ACCESS_KEY_ID="AKIAHOOKTEST"
+  export AWS_SECRET_ACCESS_KEY="secret-key"
+  export AWS_SESSION_TOKEN="session-token"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  assert_success
+  assert_line "installed fjall@${FJALL_CLI_DEFAULT_MAJOR}"
+  refute_output --partial "npm holds"
+  refute_output --partial "fjall --version holds"
+  assert_line "cli holds the deploy token"
+  assert_line "cli holds BUILDKITE_AGENT_ACCESS_TOKEN"
+  assert_line "cli holds AWS_ACCESS_KEY_ID"
+  assert_line "cli holds AWS_SECRET_ACCESS_KEY"
+  assert_line "cli holds AWS_SESSION_TOKEN"
+  refute_output --partial "${EXPECTED_DEPLOY_TOKEN}"
+}
+
+# The token reaches one process the hook runs, the CLI. An
+# environment-supplied one is out of the environment before the first
+# property check starts a process, and the hook holds it under no second
+# name: a job's own DEPLOY_TOKEN reaches the CLI as the job set it. Every
+# command the hook runs on this path says whether it holds the token.
+@test "no process the hook runs but the CLI holds an environment-supplied token" {
+  export EXPECTED_DEPLOY_TOKEN="${FJALL_API_KEY}"
+  export DEPLOY_TOKEN="the job's own value"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  shim_reporting_the_token tr sort mktemp date tee grep rm node npm fjall
+
+  PATH="${TOKEN_SHIMS}:${PATH}" run "$PWD/hooks/command"
+
+  assert_success
+  assert_line "fjall ci holds the deploy token"
+  refute_line --regexp '^(tr|sort|mktemp|date|tee|grep|rm|node|npm) .*holds the deploy token$'
+  refute_line "fjall --version holds the deploy token"
+  run grep -Fx "DEPLOY_TOKEN=the job's own value" "$BATS_TEST_TMPDIR/cli-env"
+  assert_success
+}
+
+# A token fetched from the secret store is never in the environment either,
+# even where the shell exports whatever it sets (allexport, here from
+# BASH_ENV), and the job's own DEPLOY_TOKEN still reaches the CLI as the job
+# set it.
+@test "no process the hook runs but the CLI holds a fetched token, under allexport too" {
+  unset FJALL_API_KEY
+  export EXPECTED_DEPLOY_TOKEN="fjall_dk_fetched"
+  export DEPLOY_TOKEN="the job's own value"
+  stub buildkite-agent \
+    "secret get FJALL_API_KEY : echo 'fjall_dk_fetched'" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  printf 'set -a\n' > "$BATS_TEST_TMPDIR/allexport"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  shim_reporting_the_token tr sort mktemp date tee grep rm node npm fjall buildkite-agent
+
+  BASH_ENV="$BATS_TEST_TMPDIR/allexport" PATH="${TOKEN_SHIMS}:${PATH}" run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  assert_line "cli holds the deploy token"
+  assert_line "fjall ci holds the deploy token"
+  refute_line --regexp '^(tr|sort|mktemp|date|tee|grep|rm|node|npm|buildkite-agent) .*holds the deploy token$'
+  refute_line "fjall --version holds the deploy token"
+  run grep -Fx "DEPLOY_TOKEN=the job's own value" "$BATS_TEST_TMPDIR/cli-env"
+  assert_success
+}
+
+# An xtrace the shell inherits, from BASH_ENV or from SHELLOPTS in the
+# environment, would print each command the hook runs into the job log, the
+# token's handover to the CLI among them. The hook turns it off before it
+# reads the token. The tools here are POSIX sh scripts, which read neither,
+# so the hook is the only shell that could trace the token.
+@test "an inherited xtrace never prints the deploy token" {
+  local tools="$BATS_TEST_TMPDIR/sh-tools" setting
+  mkdir -p "$tools"
+  printf '#!/bin/sh\necho "v%s"\n' "${HOOK_NODE_VERSION}" > "$tools/node"
+  printf '#!/bin/sh\necho "installed $*"\n' > "$tools/npm"
+  printf '%s\n' '#!/bin/sh' \
+    'if [ "$1" = --version ]; then echo "fjall/0.88.3"; exit 0; fi' \
+    'echo "cli received: $*"' \
+    'if [ "${FJALL_API_KEY-}" = "${EXPECTED_DEPLOY_TOKEN}" ]; then echo "cli holds the deploy token"; fi' > "$tools/fjall"
+  chmod +x "$tools/node" "$tools/npm" "$tools/fjall"
+  printf 'set -x\n' > "$BATS_TEST_TMPDIR/xtrace"
+  export EXPECTED_DEPLOY_TOKEN="${FJALL_API_KEY}"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  for setting in "BASH_ENV=$BATS_TEST_TMPDIR/xtrace" "SHELLOPTS=xtrace"; do
+    PATH="${tools}:${PATH}" run env "${setting}" "$PWD/hooks/command"
+
+    assert_success
+    assert_line "+ set -euo pipefail"
+    assert_line "cli received: ci run deploy my-app --non-interactive"
+    assert_line "cli holds the deploy token"
+    refute_output --partial "${EXPECTED_DEPLOY_TOKEN}"
+  done
+}
+
+# The hook keeps an environment-supplied token from everything it runs but
+# the CLI, and leaves it in the environment it hands the hooks after it, so
+# they see it as the hooks before it did.
+@test "an environment-supplied token is left for the hooks after a run that succeeds" {
+  export EXPECTED_DEPLOY_TOKEN="${FJALL_API_KEY}"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run_hook_through_agent_wrapper
+
+  assert_success
+  assert_line "cli holds the deploy token"
+  refute_output --partial "npm holds"
+  run grep -Fx "FJALL_API_KEY=${EXPECTED_DEPLOY_TOKEN}" "$BATS_TEST_TMPDIR/env-after"
+  assert_success
+}
+
+# A token fetched from the secret store reaches the CLI alone: it is in no
+# line of the environment the hook leaves, so no hook after it sees it.
+@test "a fetched token is never left for the hooks after the run" {
+  unset FJALL_API_KEY
+  export EXPECTED_DEPLOY_TOKEN="fjall_dk_fetched"
+  stub buildkite-agent \
+    "secret get FJALL_API_KEY : echo 'fjall_dk_fetched'" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run_hook_through_agent_wrapper
+
+  unstub buildkite-agent
+  assert_success
+  assert_line "cli holds the deploy token"
+  run grep -v '^EXPECTED_DEPLOY_TOKEN=' "$BATS_TEST_TMPDIR/env-after"
+  assert_success
+  refute_output --partial "fjall_dk_fetched"
+}
+
+# The agent carries what a hook that exits 0 leaves into the rest of the
+# job: its environment, and its working directory, which the later hooks
+# and the artifact upload start in. The hook leaves both as the job had them,
+# on the path that changes the most: a Node bootstrapped onto PATH, a
+# working-directory to move into, and job variables that share their names
+# with the hook's own.
+@test "a run that succeeds leaves the job's environment and working directory as it found them" {
+  node --version > /dev/null
+  unstub node
+  stub node "--version : echo 'v18.20.5'"
+  stub_node_bootstrap x86_64 x64
+  export REGION="eu-west-1" ENVIRONMENT="production" NODE_VERSION="22.0.0" DEPLOY_TOKEN="the job's own value"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_WORKING_DIRECTORY="tests"
+
+  run_hook_through_agent_wrapper
+
+  unstub curl
+  unstub sha256sum
+  unstub tar
+  assert_success
+  assert_line "bootstrapped npm ran: install -g --ignore-scripts fjall@${FJALL_CLI_DEFAULT_MAJOR}"
+  assert_line "cli received: ci run deploy my-app --non-interactive"
+  run diff <(grep -v -e '^_=' "$BATS_TEST_TMPDIR/env-before") \
+    <(grep -v -e '^_=' -e '^BUILDKITE_HOOK_EXIT_STATUS=' -e '^BUILDKITE_HOOK_WORKING_DIR=' "$BATS_TEST_TMPDIR/env-after")
+  assert_success
+  run grep -Fx "BUILDKITE_HOOK_WORKING_DIR=$PWD" "$BATS_TEST_TMPDIR/env-after"
+  assert_success
+}
+
+# The hook's own variables are lower-case, so a variable the job exports
+# reaches the CLI, and with it the job's infrastructure.ts and image builds,
+# as the job set it, whatever name the hook once gave one of its own. A
+# property the plugin is given still reaches the CLI as its flag. These three
+# runs between them set every variable the hook has: the Node bootstrap's,
+# the `auto` install's, and the tier path's, where an upper-case
+# INCOMPATIBLE, made an array, was dropped.
+@test "a job variable reaches the CLI as the job set it, under any name the hook once used, on the bootstrap path" {
+  node --version > /dev/null
+  unstub node
+  stub node "--version : echo 'v18.20.5'"
+  stub_node_bootstrap x86_64 x64
+  export_former_hook_names
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_REGION="eu-west-1"
+
+  run "$PWD/hooks/command"
+
+  unstub curl
+  unstub sha256sum
+  unstub tar
+  assert_success
+  assert_line "cli received: ci run deploy my-app --non-interactive --region eu-west-1"
+  assert_cli_was_given_the_job_values
+}
+
+@test "a job variable reaches the CLI as the job set it, under any name the hook once used, on the auto install path" {
+  node --version > /dev/null
+  unstub node
+  stub node \
+    "--version : echo 'v${HOOK_NODE_VERSION}'" \
+    ":: echo 'fjall@7'"
+  unstub npm || true
+  stub npm "install -g --ignore-scripts fjall@7 : echo 'installed fjall@7'"
+  export_former_hook_names
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_CLI_VERSION="auto"
+
+  run "$PWD/hooks/command"
+
+  assert_success
+  assert_line "installed fjall@7"
+  assert_line "cli received: ci run deploy my-app --non-interactive"
+  assert_cli_was_given_the_job_values
+}
+
+@test "a job variable reaches the CLI as the job set it, under any name the hook once used, on a tier target" {
+  export_former_hook_names
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="organisation"
+
+  run "$PWD/hooks/command"
+
+  assert_success
+  assert_line "cli received: org deploy --non-interactive"
+  assert_cli_was_given_the_job_values
+}
+
+# The class, for a variable added later: the hook sets no upper-case name
+# but PATH, which hands the CLI a bootstrapped Node, and FJALL_API_KEY, the
+# token's own name, in any form variables_set_in reads, which covers every
+# form the hook uses. A name set in a form it does not read goes unseen, so
+# a variable the hook sets in a new form needs the helper taught that form.
+@test "the hook sets no upper-case variable but PATH and FJALL_API_KEY" {
+  local names
+  names="$(variables_set_in "$PWD/hooks/command" | sort -u)"
+  [ -n "${names}" ]
+  run grep -E '^[A-Z]' <<< "${names}"
+  assert_output "FJALL_API_KEY
+PATH"
+}
+
+# A secret the store cannot answer stops the step before anything is
+# downloaded or installed, rather than leaving the CLI to fall back on
+# whatever credentials a persistent agent has stored.
+@test "a failed secret fetch stops the step before anything is installed" {
+  unset FJALL_API_KEY
+  stub buildkite-agent "secret get FJALL_API_KEY : echo 'secret not found' >&2; exit 1"
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  refute_output --partial "Installing fjall"
+  refute_output --partial "cli received:"
+}
+
+# L3 (design § 5.2) — when the agent's node is below node_floor the hook
 # bootstraps a pinned build, verified against its SHA-256 before extraction,
-# and prepends it to PATH.
+# and prepends it to PATH: the install then runs the bootstrapped npm, not the
+# agent's.
 @test "bootstraps a pinned, SHA-verified Node when the agent node is too old" {
   # Drain setup()'s compatible-node plan, then replace with an old node so the
   # bootstrap path fires (mirrors the fjall drain-then-replace idiom above).
   node --version > /dev/null
   unstub node
   stub node "--version : echo 'v18.20.5'"
-  stub uname "-s : echo 'Linux'" "-m : echo 'x86_64'"
-  stub curl "-fsSL -o * * : true"
-  stub sha256sum "-c - : true"
-  stub tar "-xJf * -C * : true"
+  stub_node_bootstrap x86_64 x64
 
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
 
@@ -594,7 +1218,47 @@ teardown() {
   unstub tar
   assert_success
   assert_output --partial "Bootstrapping Node ${HOOK_NODE_VERSION}"
-  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+  assert_line "sha256sum checked the pinned x64 digest"
+  assert_line "bootstrapped npm ran: install -g --ignore-scripts fjall@${FJALL_CLI_DEFAULT_MAJOR}"
+  refute_line "installed fjall@${FJALL_CLI_DEFAULT_MAJOR}"
+  assert_line "cli received: ci run deploy my-app --non-interactive"
+}
+
+# The arm64 twin: its own tarball and its own digest.
+@test "bootstraps the arm64 build, against the arm64 digest, on an aarch64 agent" {
+  node --version > /dev/null
+  unstub node
+  stub node "--version : echo 'v18.20.5'"
+  stub_node_bootstrap aarch64 arm64
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub curl
+  unstub sha256sum
+  unstub tar
+  assert_success
+  assert_line "sha256sum checked the pinned arm64 digest"
+  assert_line "bootstrapped npm ran: install -g --ignore-scripts fjall@${FJALL_CLI_DEFAULT_MAJOR}"
+}
+
+# An architecture with no pinned build is refused, before any download.
+@test "a below-floor agent on an architecture with no pinned build is refused before any download" {
+  node --version > /dev/null
+  unstub node
+  stub node "--version : echo 'v18.20.5'"
+  stub uname "-s : echo 'Linux'" "-m : echo 's390x'" "-m : echo 's390x'"
+  stub curl ":: echo 'curl ran'; exit 1"
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  assert_failure
+  assert_output --partial "unsupported architecture 's390x' for Node bootstrap"
+  refute_output --partial "curl ran"
+  refute_output --partial "Installing fjall"
 }
 
 # The floor is a full version, not a major. 22.3.0 is a Node 22 — it passed the
@@ -604,10 +1268,7 @@ teardown() {
   node --version > /dev/null
   unstub node
   stub node "--version : echo 'v22.3.0'"
-  stub uname "-s : echo 'Linux'" "-m : echo 'x86_64'"
-  stub curl "-fsSL -o * * : true"
-  stub sha256sum "-c - : true"
-  stub tar "-xJf * -C * : true"
+  stub_node_bootstrap x86_64 x64
 
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
 
@@ -619,7 +1280,8 @@ teardown() {
   assert_success
   assert_output --partial "Bootstrapping Node ${HOOK_NODE_VERSION}"
   assert_output --partial "agent node: 22.3.0"
-  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+  assert_line "bootstrapped npm ran: install -g --ignore-scripts fjall@${FJALL_CLI_DEFAULT_MAJOR}"
+  assert_line "cli received: ci run deploy my-app --non-interactive"
 }
 
 # The other direction: an agent exactly AT the floor is compatible and is not
@@ -629,7 +1291,7 @@ teardown() {
   node --version > /dev/null
   unstub node
   stub node "--version : echo 'v${HOOK_NODE_FLOOR}'"
-  stub curl "-fsSL -o * * : exit 1"
+  stub curl ":: echo 'curl ran'; exit 1"
 
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
 
@@ -637,7 +1299,7 @@ teardown() {
 
   assert_success
   refute_output --partial "Bootstrapping Node"
-  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+  assert_line "cli received: ci run deploy my-app --non-interactive"
 }
 
 # The pinned builds are Linux tarballs. A below-floor agent on any other OS is
@@ -649,7 +1311,7 @@ teardown() {
   unstub node
   stub node "--version : echo 'v22.3.0'"
   stub uname "-s : echo 'Darwin'"
-  stub curl "-fsSL -o * * : exit 1"
+  stub curl ":: echo 'curl ran'; exit 1"
 
   export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
 
@@ -674,6 +1336,14 @@ teardown() {
   assert_output --partial "could not read NOT_A_REAL_PIN"
 }
 
+# The same for the manifest's property lists: a table test over a list this
+# suite could not read would pass having run nothing.
+@test "a property list this suite cannot read fails rather than passing over nothing" {
+  run properties_of_type no-such-type
+  assert_failure
+  assert_output --partial "could not read any no-such-type property"
+}
+
 # The SHA-256 check is a gate, not a log line: a digest mismatch aborts under
 # `set -e` before the tarball is extracted or the CLI runs.
 @test "a Node tarball failing SHA-256 verification aborts before extraction" {
@@ -681,7 +1351,7 @@ teardown() {
   unstub node
   stub node "--version : echo 'v18.20.5'"
   stub uname "-s : echo 'Linux'" "-m : echo 'x86_64'"
-  stub curl "-fsSL -o * * : true"
+  stub curl "-fsSL --connect-timeout 20 --speed-limit 1024 --speed-time 60 --max-time 600 --retry 2 --retry-max-time 300 -o * * : true"
   stub sha256sum "-c - : exit 1"
   # Make extraction observable. A correct gate aborts under set -e before `tar`
   # runs, so this plan stays unconsumed (teardown's tolerant `unstub tar` covers
@@ -703,16 +1373,30 @@ teardown() {
 }
 
 # Flag-shaped property values are rejected before fjall runs — a value beginning
-# with '-' would be parsed by commander as a flag rather than a value.
-@test "a flag-shaped property value is rejected before fjall runs" {
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
-  export BUILDKITE_PLUGIN_FJALL_DEPLOY_SERVICE="--oops"
+# with '-' would be parsed by commander as a flag rather than a value. The
+# properties are plugin.yml's strings, less the two the hook consumes itself
+# and never passes to the CLI (`npm install -g "fjall@<cli-version>"` and
+# `cd -- <working-directory>`), so a guard dropped from the hook, or a string
+# property added without one, fails here.
+@test "every string property that reaches the CLI's argv refuses a flag-shaped value" {
+  local properties property env_name
+  properties="$(properties_of_type string)"
+  for property in ${properties}; do
+    case "${property}" in
+      cli-version | working-directory) continue ;;
+    esac
+    env_name="$(property_env "${property}")"
 
-  run "$PWD/hooks/command"
+    export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+    export "${env_name}=--oops"
+    run "$PWD/hooks/command"
+    unset "${env_name}"
 
-  assert_failure
-  assert_output --partial "'service' must not begin with '-'"
-  refute_output --partial "ci run"
+    assert_failure
+    assert_output --partial "'${property}' must not begin with '-'"
+    refute_output --partial "--oops"
+    refute_output --partial "Installing fjall"
+  done
 }
 
 # The guard also fires per item for the array properties, and BEFORE any
@@ -726,6 +1410,7 @@ teardown() {
 
   assert_failure
   assert_output --partial "'build-args' must not begin with '-'"
+  refute_output --partial "sneaky"
   refute_output --partial "Installing fjall"
 }
 
@@ -737,6 +1422,226 @@ teardown() {
 
   assert_failure
   assert_output --partial "'build-secrets' must not begin with '-'"
+  refute_output --partial "sneaky"
+  refute_output --partial "Installing fjall"
+}
+
+# A single `-` reads as no list, but a `-` item inside one is a flag-shaped
+# value like any other: an optional item written `- "${EXTRA:--}"` is
+# refused, not dropped or handed to the CLI as `--build-arg -`.
+@test "a - item inside a list property is refused as flag-shaped" {
+  local property env_name
+  for property in build-args build-secrets; do
+    env_name="$(property_env "${property}")"
+    export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+    export "${env_name}_0=A=1" "${env_name}_1=-"
+    run "$PWD/hooks/command"
+    unset "${env_name}_0" "${env_name}_1"
+
+    assert_failure
+    assert_output --partial "'${property}' must not begin with '-'. The value given is not repeated here."
+    refute_output --partial "Installing fjall"
+  done
+}
+
+# A boolean property is exactly true or false: what the agent hands the hook
+# for a YAML boolean. Read as anything but `true`, these spellings once
+# reached the false arm, which for plan, require-approval and no-cascade is
+# the one that changes more. Each is refused before anything is fetched or
+# installed, and the value is not repeated. The properties are plugin.yml's
+# booleans, so one added to the manifest joins the test.
+@test "every boolean property refuses a value that is not true or false, before anything runs" {
+  local properties property env_name spelling
+  token_left_to_secret_store
+  properties="$(properties_of_type boolean)"
+  for property in ${properties}; do
+    env_name="$(property_env "${property}")"
+    for spelling in True TRUE yes on 1 False no off 0 " true" "true " "false
+"; do
+      export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+      export "${env_name}=${spelling}"
+      run "$PWD/hooks/command"
+      unset "${env_name}"
+
+      assert_failure
+      assert_output --partial "'${property}' must be true or false. The value given is not repeated here."
+      refute_output --partial "Installing fjall"
+      refute_output --partial "Fetching FJALL_API_KEY"
+    done
+  done
+}
+
+# An empty value is something the pipeline wrote, most often an interpolation
+# whose variable is unset (`plan: "${PLAN_ONLY}"`): the agent sets no variable
+# for a property left out. Read as false it ran the arm that changes more, so
+# it is refused, before anything is fetched or installed.
+@test "every boolean property refuses an empty value, before anything runs" {
+  local properties property env_name
+  token_left_to_secret_store
+  properties="$(properties_of_type boolean)"
+  for property in ${properties}; do
+    env_name="$(property_env "${property}")"
+    export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+    export "${env_name}="
+    run "$PWD/hooks/command"
+    unset "${env_name}"
+
+    assert_failure
+    assert_output --partial "'${property}' is empty: give true or false, or leave it out to take its default."
+    refute_output --partial "Installing fjall"
+    refute_output --partial "Fetching FJALL_API_KEY"
+  done
+}
+
+# An empty string property was read as the property left out, so
+# `image-tag: "${ROLLBACK_TAG}"` with the variable unset built and deployed
+# rather than rolling back. Every one is refused, before anything is fetched
+# or installed, and an empty target as a missing one. The properties are
+# plugin.yml's strings.
+@test "every string property refuses an empty value, before anything runs" {
+  local properties property env_name
+  token_left_to_secret_store
+  properties="$(properties_of_type string)"
+  for property in ${properties}; do
+    env_name="$(property_env "${property}")"
+    export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+    export "${env_name}="
+    run "$PWD/hooks/command"
+    unset "${env_name}"
+
+    assert_failure
+    if [ "${property}" = target ]; then
+      assert_output --partial "Error: 'target' is required"
+    else
+      assert_output --partial "'${property}' is empty: give it a value, or leave it out."
+    fi
+    refute_output --partial "Installing fjall"
+    refute_output --partial "Fetching FJALL_API_KEY"
+  done
+}
+
+# The other half: `false` reads as false, as a property left out does, so
+# every boolean property set to it deploys with none of the flags. A plan
+# answers one run, so each run puts them back first.
+@test "every boolean property reads false as false" {
+  local properties property env_name
+  properties="$(properties_of_type boolean)"
+  for property in ${properties}; do
+    env_name="$(property_env "${property}")"
+    restub_agent_tools
+    export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+    export "${env_name}=false"
+    run "$PWD/hooks/command"
+    unset "${env_name}"
+
+    assert_success
+    assert_line "cli received: ci run deploy my-app --non-interactive"
+  done
+}
+
+# `-` is the spelling of "none" for a property with no value of its own, as
+# in the GitHub Action: `image-tag: "${ROLLBACK_TAG:--}"` writes it when the
+# variable is unset or empty, and the property reads as left out, on the app
+# path and beside a tier target alike. A list property's single `-` reads the
+# same way. The properties are plugin.yml's.
+@test "every property with no value of its own reads - as left out" {
+  local properties property env_name
+  properties="$(properties_by_own_value without)"
+  for property in ${properties}; do
+    env_name="$(property_env "${property}")"
+    restub_agent_tools
+    export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+    export "${env_name}=-"
+    run "$PWD/hooks/command"
+    unset "${env_name}"
+
+    assert_success
+    assert_line "cli received: ci run deploy my-app --non-interactive"
+  done
+
+  restub_agent_tools
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="organisation"
+  for property in ${properties}; do
+    export "$(property_env "${property}")=-"
+  done
+  run "$PWD/hooks/command"
+  assert_success
+  assert_line "cli received: org deploy --non-interactive"
+}
+
+# The other half: `-` means none only for a property with no value of its
+# own. Every other property refuses it, before anything is fetched or
+# installed: one with a default, which would otherwise take it as a value
+# (cli-version as a version for npm, working-directory as cd's previous
+# directory), and target, which has no none. The properties are plugin.yml's.
+@test "every property with a value of its own refuses -, before anything runs" {
+  local properties property env_name
+  token_left_to_secret_store
+  properties="$(properties_by_own_value with)"
+  for property in ${properties}; do
+    env_name="$(property_env "${property}")"
+    export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+    export "${env_name}=-"
+    run "$PWD/hooks/command"
+    unset "${env_name}"
+
+    assert_failure
+    assert_output --partial "Error: '${property}' "
+    refute_output --partial "Installing fjall"
+    refute_output --partial "Fetching FJALL_API_KEY"
+  done
+}
+
+# A list property given as a single value arrives under the bare name, which
+# the composition loops never read: the items were dropped without a word.
+# An empty one (`build-args: "${EXTRA_ARGS}"`, the variable unset) is
+# refused as empty, and says nothing of a value withheld, as there is none.
+@test "a single value where a list property belongs is refused" {
+  local property env_name
+  for property in build-args build-secrets; do
+    env_name="$(property_env "${property}")"
+    export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+    export "${env_name}=A=1"
+    run "$PWD/hooks/command"
+    assert_failure
+    assert_output --partial "'${property}' must be a list of strings, not a single value. The value given is not repeated here."
+    refute_output --partial "A=1"
+    refute_output --partial "Installing fjall"
+
+    export "${env_name}="
+    run "$PWD/hooks/command"
+    unset "${env_name}"
+    assert_failure
+    assert_output --partial "'${property}' is empty: give it a list of strings, or leave it out."
+    refute_output --partial "not repeated"
+    refute_output --partial "Installing fjall"
+  done
+}
+
+# An empty item ended the composition loop, dropping every item after it; a
+# map, or a list of maps, arrives under names no loop read.
+@test "a list property with an empty item, or a map in it, is refused" {
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_0="A=1"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_1=""
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_2="C=3"
+  run "$PWD/hooks/command"
+  assert_failure
+  assert_output --partial "'build-args' item 2 is empty."
+  refute_output --partial "Installing fjall"
+  unset BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_0 BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_1 BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_2
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS_GIT_SHA="abc"
+  run "$PWD/hooks/command"
+  assert_failure
+  assert_output --partial "'build-secrets' must be a list of strings."
+  unset BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_SECRETS_GIT_SHA
+
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_ARGS_0_KEY="A"
+  run "$PWD/hooks/command"
+  assert_failure
+  assert_output --partial "'build-args' must be a list of strings."
   refute_output --partial "Installing fjall"
 }
 
