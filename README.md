@@ -341,6 +341,21 @@ steps:
 
 The production step builds what it deploys. `skip-build` would not reuse what staging built: it skips only a static-site or OpenNext build command, never a Docker build.
 
+## Installing Your Project's Dependencies
+
+The plugin installs only the `fjall` CLI, and its `command` hook replaces the step's own command, so the step can't install anything before the deploy. When the deploy builds your app, as it does for a Payload or Next.js app that OpenNext builds, the build needs your project's dependencies installed. Install them from a repository `pre-command` hook (`.buildkite/hooks/pre-command`). That hook runs before every job of the pipeline, so limit it to the deploy step and run the install in the folder that holds the lockfile.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${BUILDKITE_STEP_KEY:-}" == "deploy" ]]; then
+  cd path/to/project
+  npm ci
+fi
+```
+
+Use the install your lockfile calls for, such as `corepack enable && pnpm install --frozen-lockfile` or `corepack enable && yarn install --immutable`.
+
 ## Caching the CLI Install
 
 The hook installs `cli-version` with `npm install -g` on every run. npm's cache spares the download, and it also decides what is installed: npm checks a package against the integrity its metadata names, reads that metadata from the same cache, and serves a cached copy without asking the registry while the copy's headers call it fresh. Measured on npm 11.17.0 (2026-10-15), metadata and a tarball planted in npm's cache made `npm install -g` install a version the registry never published and run its install script, which in this hook runs with `FJALL_API_KEY` exported. `--prefer-online` did not stop it: npm asked the registry, which answered the ETags the planted entries carried with 304 Not Modified, and npm kept the planted copies. Whoever can write the cache chooses the CLI your deploy runs, so share it only with builds you would trust to deploy:
