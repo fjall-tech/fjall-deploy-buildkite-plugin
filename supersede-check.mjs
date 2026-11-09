@@ -18,20 +18,28 @@
  * BUILDKITE_PIPELINE_SLUG, BUILDKITE_BUILD_NUMBER and BUILDKITE_COMMIT, and
  * prints exactly one line, `supersede: skipped for #<n> at <sha>` with exit
  * code 10, `supersede: held by #<n>, whose deploy result is <word>` or
- * `supersede: holding, <reason>` with exit code 11, or
- * `supersede: deploying, <reason>` with exit code 0. It never prints a
- * response body, the token or an environment value.
+ * `supersede: holding, <reason>` or
+ * `supersede: overtaken by #<n>, which is newer and started or recorded a
+ * deploy` with exit code 11, or `supersede: deploying, <reason>` with exit
+ * code 0. It never
+ * prints a response body, the token or an environment value.
  *
  * This build X, at commit x, skips only when all of these hold.
  *
- * 1. One page of the pipeline's 100 newest `main` builds, read with the token,
- *    is newest first, holds only `main` builds and reaches X, and X's own
- *    entry carries the creator's marker `fjall-deploy:supersedable` = `true`.
+ * 1. One page of the pipeline's 100 newest `main` builds, read with the token
+ *    and every retried job, is newest first, holds only `main` builds and
+ *    reaches X, and X's own entry carries the creator's marker
+ *    `fjall-deploy:supersedable` = `true`.
  * 2. Y, the newest build above X that is running with `fjall-deploy:result`
- *    unset or `success`, or passed with it `success`, exists. If Y then fails
- *    a check, X does not skip, and looks no further back for another Y.
- * 3. Y's commit y is a full sha, and Y has exactly one job keyed `<after>`,
- *    which passed.
+ *    unset or `success`, or passed with it `success`, exists. A result counts
+ *    only when the attempt that last started a deploy recorded it, so one an
+ *    earlier attempt left reads as unset. A running build whose last started
+ *    attempt recorded nothing counts only until the job that started it ends,
+ *    since a deploy that ended with no result deployed nothing this check can
+ *    see. If Y then fails a check, X does not skip, and looks no further back
+ *    for another Y.
+ * 3. Y's commit y is a full sha, and Y has exactly one job keyed `<after>`
+ *    that was not retried, which passed.
  * 4. x has a parent and is on y's first parent line, and no commit from y
  *    down to x, both included, is a barrier. A barrier's diff against its
  *    first parent touches a `<barrier>` path, read literally, or its message
@@ -40,12 +48,30 @@
  * X never skips when its own `fjall-deploy:result` is already set to anything
  * but `superseded` or `success`, since only a retry of a deploy that did not
  * succeed carries one, and a skip would write over it the result that names
- * that deploy red.
+ * that deploy red. Nor does X skip once its own `fjall-deploy:started` is set,
+ * since an earlier attempt then started a deploy whose result may be lost.
+ *
+ * The hook writes `fjall-deploy:started` as the job's id just before the CLI
+ * runs, and `fjall-deploy:result-job` as the same id once it has recorded
+ * `fjall-deploy:result`. A retry is a new job, so the two agree only when the
+ * attempt that last started a deploy recorded its result.
+ *
+ * A marked X that does not skip holds as overtaken when a newer build on the
+ * page started a deploy or recorded the result of one, since x would deploy
+ * over it. That newer build may have deployed and then failed a later step,
+ * so it is no Y, or deployed while X was held and before X was retried. A
+ * rebuild of X, which never holds, deploys x anyway.
  *
  * A marked X that does not skip deploys only when P, the newest build below X
- * on the page whose `fjall-deploy:result` is set and is not `superseded`,
- * recorded `success`, or X's entry carries the creator's marker
- * `fjall-deploy:red-cleared` = P's number. A build with no result deployed
+ * on the page that recorded a deploy, recorded `success`, or X's entry carries
+ * the creator's marker `fjall-deploy:red-cleared` = P's number. A build
+ * recorded a deploy when its last started attempt recorded a result that is
+ * not `superseded`, or when that attempt recorded none. The second reads as
+ * the result `unrecorded` once the job that started the deploy has ended, or,
+ * when the page does not list that job, once the build has ended. Until
+ * then X is held by it as `unfinished`, which no marker clears, since that
+ * deploy may still be running. A build that started no deploy is read by its
+ * `fjall-deploy:result` alone. One with no result, or `superseded`, deployed
  * nothing, so it is passed over, as webapp's deploy-decide.jq passes it over.
  * With no P, X deploys only when the page is shorter than its size, since
  * such a page is the pipeline's whole history.
@@ -62,6 +88,12 @@ export const HOLD_EXIT_CODE = 11;
 export const SUPERSEDABLE_KEY = "fjall-deploy:supersedable";
 export const RED_CLEARED_KEY = "fjall-deploy:red-cleared";
 export const RESULT_KEY = "fjall-deploy:result";
+export const STARTED_KEY = "fjall-deploy:started";
+export const RESULT_JOB_KEY = "fjall-deploy:result-job";
+/** The result an ended build that started a deploy and recorded none reads as. */
+export const UNRECORDED_RESULT = "unrecorded";
+/** The result a build reads as while a deploy it started may still be running. */
+export const UNFINISHED_RESULT = "unfinished";
 export const PAGE_SIZE = 100;
 const MAX_RANGE = 1000;
 const DEFAULT_LIMITS = Object.freeze({
@@ -80,37 +112,63 @@ const SIGTERM_GRACE_MS = 2_000;
 const DEPLOY_ALONE = /^deploy-alone/m;
 
 /**
- * Which Buildkite build states can be Y, over the documented state union. An
- * unknown state is absent, so it reads as not eligible. A running build has
- * deployed nothing once it records any result but `success`. It may have
+ * What each documented Buildkite build state means to the check. An unknown
+ * state is absent, so it reads as not eligible and not ended.
+ *
+ * `eligibility` says whether a build in the state can be Y. A running build
+ * has deployed nothing once it records any result but `success`. It may have
  * skipped itself, or soft failed its deploy, while later steps still run.
+ *
+ * `ended` says whether the build has finished, so a deploy it started and
+ * recorded no result for will record none. It decides only when the page no
+ * longer lists the job that started the deploy. The states that read as ended
+ * are the ones webapp's deploy-decide.jq lists in `ended_empty`.
  */
-const STATE_ELIGIBILITY = Object.freeze({
-  creating: "no",
-  scheduled: "no",
-  running: "unless-it-recorded-another-result",
-  failing: "no",
-  canceling: "no",
-  blocked: "no",
-  passed: "if-it-recorded-success",
-  failed: "no",
-  canceled: "no",
-  skipped: "no",
-  not_run: "no",
+const BUILD_STATES = Object.freeze({
+  creating: { eligibility: "no", ended: false },
+  scheduled: { eligibility: "no", ended: false },
+  running: { eligibility: "unless-it-recorded-another-result", ended: false },
+  failing: { eligibility: "no", ended: false },
+  canceling: { eligibility: "no", ended: false },
+  blocked: { eligibility: "no", ended: false },
+  passed: { eligibility: "if-it-recorded-success", ended: true },
+  failed: { eligibility: "no", ended: true },
+  canceled: { eligibility: "no", ended: true },
+  skipped: { eligibility: "no", ended: true },
+  not_run: { eligibility: "no", ended: true },
 });
 
-function isEligible(build) {
-  const eligibility = Object.hasOwn(STATE_ELIGIBILITY, build.state)
-    ? STATE_ELIGIBILITY[build.state]
-    : "no";
-  if (eligibility === "no" || !isRecord(build.meta_data)) return false;
-  const result = Object.hasOwn(build.meta_data, RESULT_KEY)
-    ? build.meta_data[RESULT_KEY]
+function stateOf(build) {
+  return Object.hasOwn(BUILD_STATES, build.state)
+    ? BUILD_STATES[build.state]
+    : { eligibility: "no", ended: false };
+}
+
+/**
+ * The states of a job that ran and will run no more. Any other state, one
+ * this check does not know included, reads as a job that may still deploy.
+ */
+const ENDED_JOB_STATES = new Set(["passed", "failed", "canceled", "timed_out"]);
+
+/** A build's own meta-data value under `key`, or undefined when it has none. */
+function metaValue(build, key) {
+  return isRecord(build.meta_data) && Object.hasOwn(build.meta_data, key)
+    ? build.meta_data[key]
     : undefined;
-  if (result === "success") return true;
-  return (
-    eligibility === "unless-it-recorded-another-result" && result === undefined
-  );
+}
+
+/** True for a result that records no deploy, as deploy-decide.jq reads one. */
+function recordsNoDeploy(result) {
+  return result === undefined || result === "" || result === "superseded";
+}
+
+function isEligible(build) {
+  const { eligibility } = stateOf(build);
+  if (eligibility === "no" || !isRecord(build.meta_data)) return false;
+  const running = eligibility === "unless-it-recorded-another-result";
+  if (startedUnrecorded(build)) return running && !startedDeployEnded(build);
+  const result = metaValue(build, RESULT_KEY);
+  return result === "success" || (running && result === undefined);
 }
 
 const deploy = (reason) => ({ kind: "deploy", reason });
@@ -183,7 +241,7 @@ async function readBuildsPage({
 }) {
   const remaining = deadline - Date.now();
   if (remaining <= 0) return { ok: false, reason: boundReason(limits) };
-  const url = `${API_ORIGIN}/v2/organizations/${org}/pipelines/${pipeline}/builds?branch=main&per_page=${PAGE_SIZE}`;
+  const url = `${API_ORIGIN}/v2/organizations/${org}/pipelines/${pipeline}/builds?branch=main&per_page=${PAGE_SIZE}&include_retried_jobs=true`;
   const signal = AbortSignal.timeout(Math.min(limits.readMs, remaining));
   let response;
   try {
@@ -274,15 +332,70 @@ function carriesMarker(build) {
   );
 }
 
+/** The job id of the attempt that last started a deploy, or undefined. */
+function startedBy(build) {
+  const job = metaValue(build, STARTED_KEY);
+  return typeof job === "string" && job !== "" ? job : undefined;
+}
+
+/**
+ * True when an attempt of this build started a deploy and recorded no result
+ * after it. The hook writes the started marker just before the CLI runs, then
+ * the result and the result job once it exits, so only a lost write, or a job
+ * stopped between the two, leaves them apart. A result beside a result job
+ * that is not the started one was left by an earlier attempt.
+ */
+function startedUnrecorded(build) {
+  const job = startedBy(build);
+  if (job === undefined) return false;
+  return (
+    recordsNoDeploy(metaValue(build, RESULT_KEY)) ||
+    metaValue(build, RESULT_JOB_KEY) !== job
+  );
+}
+
+/**
+ * Whether the deploy a build started has ended. The job that started it says,
+ * when the page lists it, as a page read with every retried job does. When it
+ * does not, the build's own state says instead.
+ */
+function startedDeployEnded(build) {
+  const job = startedBy(build);
+  const jobs = Array.isArray(build.jobs) ? build.jobs : [];
+  const started = jobs.find((entry) => isRecord(entry) && entry.id === job);
+  return started === undefined
+    ? stateOf(build).ended
+    : ENDED_JOB_STATES.has(started.state);
+}
+
 /** The red result a retry of this build carries, or undefined. */
 function ownRedResult(own) {
-  if (!isRecord(own.meta_data) || !Object.hasOwn(own.meta_data, RESULT_KEY)) {
-    return undefined;
-  }
-  const result = own.meta_data[RESULT_KEY];
-  return result === "" || result === "superseded" || result === "success"
+  const result = metaValue(own, RESULT_KEY);
+  return recordsNoDeploy(result) || result === "success"
     ? undefined
     : resultWord(result);
+}
+
+/**
+ * For a marked build that did not skip, the newest newer build that started
+ * a deploy or recorded the result of one, as an overtaken verdict, or
+ * undefined when none did. A newer build whose metadata is not an object
+ * holds, since it may have deployed.
+ */
+function overtakenBy(newerBuilds) {
+  for (const build of newerBuilds) {
+    if (build.meta_data === null || build.meta_data === undefined) continue;
+    if (!isRecord(build.meta_data)) {
+      return holding(`build #${build.number}'s meta-data is not an object`);
+    }
+    if (
+      startedBy(build) !== undefined ||
+      !recordsNoDeploy(metaValue(build, RESULT_KEY))
+    ) {
+      return { kind: "overtaken", number: build.number };
+    }
+  }
+  return undefined;
 }
 
 /** The rest of rules 1 to 3. Returns Y or the reason not to skip. */
@@ -295,6 +408,11 @@ function judgeNewer(builds, ownIndex, { commit, after }) {
   if (red !== undefined) {
     return deploy(
       `this build already recorded the deploy result ${red}, so its retry never skips`,
+    );
+  }
+  if (startedBy(own) !== undefined) {
+    return deploy(
+      "this build already started a deploy, so its retry never skips",
     );
   }
   if (own.commit !== commit) {
@@ -312,7 +430,7 @@ function judgeNewer(builds, ownIndex, { commit, after }) {
     return deploy(`newer build #${newer.number} lists no jobs`);
   }
   const keyed = newer.jobs.filter(
-    (job) => isRecord(job) && job.step_key === after,
+    (job) => isRecord(job) && job.step_key === after && job.retried !== true,
   );
   if (keyed.length !== 1) {
     return deploy(
@@ -338,16 +456,23 @@ function judgeBefore(builds, ownIndex, reason) {
     if (!isRecord(build.meta_data)) {
       return holding(`build #${build.number}'s meta-data is not an object`);
     }
-    const result = Object.hasOwn(build.meta_data, RESULT_KEY)
-      ? build.meta_data[RESULT_KEY]
-      : "";
-    if (result === "" || result === "superseded") continue;
-    if (result === "success") return deploy(reason);
-    const word = resultWord(result);
-    if (
-      isRecord(own.meta_data) &&
-      own.meta_data[RED_CLEARED_KEY] === String(build.number)
-    ) {
+    let word;
+    if (startedUnrecorded(build)) {
+      if (!startedDeployEnded(build)) {
+        return {
+          kind: "held",
+          number: build.number,
+          result: UNFINISHED_RESULT,
+        };
+      }
+      word = UNRECORDED_RESULT;
+    } else {
+      const result = metaValue(build, RESULT_KEY);
+      if (recordsNoDeploy(result)) continue;
+      if (result === "success") return deploy(reason);
+      word = resultWord(result);
+    }
+    if (metaValue(own, RED_CLEARED_KEY) === String(build.number)) {
       return deploy(
         `${reason}, and this build's ${RED_CLEARED_KEY} marker clears build #${build.number}'s ${word}`,
       );
@@ -560,8 +685,8 @@ async function judgeHistory({ cwd, x, y, barriers, deadline, limits }) {
  * undefined, because the hook could not read it, a doubt holds and the page
  * entry's marker decides the rest. Resolves to
  * `{ kind: "skip", number, commit }`, `{ kind: "held", number, result }`,
- * `{ kind: "holding", reason }` or `{ kind: "deploy", reason }`, and never
- * rejects.
+ * `{ kind: "overtaken", number }`, `{ kind: "holding", reason }` or
+ * `{ kind: "deploy", reason }`, and never rejects.
  */
 export async function decide({
   env,
@@ -639,9 +764,12 @@ export async function decide({
   } else {
     reason = judged.reason;
   }
-  if (marked !== true && !carriesMarker(builds[ownIndex])) {
+  const own = builds[ownIndex];
+  if (marked !== true && !carriesMarker(own)) {
     return deploy(reason);
   }
+  const overtaken = overtakenBy(builds.slice(0, ownIndex));
+  if (overtaken !== undefined) return overtaken;
   return judgeBefore(builds, ownIndex, reason);
 }
 
@@ -659,6 +787,11 @@ export function verdictLine(verdict) {
     case "held":
       return {
         line: `supersede: held by #${verdict.number}, whose deploy result is ${verdict.result}`,
+        code: HOLD_EXIT_CODE,
+      };
+    case "overtaken":
+      return {
+        line: `supersede: overtaken by #${verdict.number}, which is newer and started or recorded a deploy`,
         code: HOLD_EXIT_CODE,
       };
     case "holding":

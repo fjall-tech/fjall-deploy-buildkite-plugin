@@ -555,25 +555,89 @@ plugin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # install_step, so it never holds the deploy token, and it takes the read
 # token on stdin, never argv or env.
 #
-# A held build deployed nothing and records no `fjall-deploy:result`, so the
-# next marked build passes over it to the same red build. `$1` is the red
-# build's number, or empty when the check could not judge the deploy before
-# this one.
+# A held build deployed nothing and records neither `fjall-deploy:result` nor
+# `fjall-deploy:started`, so the next marked build passes over it to the same
+# red build. `$1` is the red build's number, or empty when the check could not
+# judge the deploy before this one. `$2` is that build's result as the check
+# names it.
 hold_deploy() {
-  local held_by="$1" red_build message
+  local held_by="$1" held_result="${2-}" red_build outcome message
   if [ -n "${held_by}" ]; then
     buildkite-agent meta-data set "fjall-deploy:held-by" "${held_by}" || true
     red_build="#${held_by}"
     if [ -n "${BUILDKITE_BUILD_URL:-}" ]; then
       red_build="[#${held_by}](${BUILDKITE_BUILD_URL%/*}/${held_by})"
     fi
-    message="This build deployed nothing. Build ${red_build}, the deploy before it, did not succeed, so this one would deploy over it. Retry that build's deploy step until it passes, then retry this one. To deploy over it anyway, Rebuild this build, which never holds."
+    if [ "${held_result}" = "unfinished" ]; then
+      message="This build deployed nothing. Build ${red_build}, the deploy before it, started a deploy that has not ended, so this one would deploy over it. Wait for that deploy to end, then retry this one. To deploy over it anyway, Rebuild this build, which never holds."
+    else
+      outcome="did not succeed"
+      if [ "${held_result}" = "unrecorded" ]; then
+        outcome="started a deploy and ended before recording its result"
+      fi
+      message="This build deployed nothing. Build ${red_build}, the deploy before it, ${outcome}, so this one would deploy over it. Retry that build's deploy step until it passes, then retry this one. To deploy over it anyway, Rebuild this build, which never holds."
+    fi
   else
     message="This build deployed nothing. The check could not prove that the deploy before it succeeded. Retry this step. To deploy anyway, Rebuild this build, which never holds."
   fi
   buildkite-agent annotate --style error --context fjall-deploy-held "${message}" || true
   echo "^^^ +++"
   exit 1
+}
+
+# A marked build that did not skip holds once a newer build has started or
+# recorded a deploy, since its older commit would deploy over that one. The
+# check stops before it judges the deploy below, so this records no
+# `fjall-deploy:held-by`.
+# `$1` is the newer build's number.
+hold_overtaken() {
+  local newer_build="#$1"
+  if [ -n "${BUILDKITE_BUILD_URL:-}" ]; then
+    newer_build="[#$1](${BUILDKITE_BUILD_URL%/*}/$1)"
+  fi
+  buildkite-agent annotate --style error --context fjall-deploy-held \
+    "This build deployed nothing. Build ${newer_build}, which is newer, has started or recorded a deploy, so this build's older commit would deploy over it. To deploy this commit anyway, Rebuild this build, which never holds." || true
+  echo "^^^ +++"
+  exit 1
+}
+
+# One job of a build holds `supersede`, since the markers it writes are the
+# build's, so a second job would write over the first one's result. A step
+# with parallelism can run its jobs at once, which no claim can order, so it
+# is refused. The claim is the build's id and the step's BUILDKITE_STEP_ID,
+# which a retry keeps. A claim naming another build reads as unset, so a
+# rebuild that carries its original's metadata is not refused. Two steps that
+# start at the same moment can both read the claim unset, so this catches a
+# second step that starts after the first, not one that runs beside it. The
+# read drops BUILDKITE_METADATA_BUILD_ID, as the marker read below does.
+claim_supersede_step() {
+  local claim claimed
+  if [ -n "${BUILDKITE_PARALLEL_JOB_COUNT:-}" ]; then
+    echo "^^^ +++"
+    echo "Error: this build deployed nothing. supersede is set on a step with parallelism, whose jobs would each write over the deploy result the others record. Set supersede on a deploy step with no parallelism."
+    exit 1
+  fi
+  if [ -z "${BUILDKITE_BUILD_ID:-}" ] || [ -z "${BUILDKITE_STEP_ID:-}" ]; then
+    echo "^^^ +++"
+    echo "Error: this build deployed nothing. The job has no BUILDKITE_BUILD_ID or BUILDKITE_STEP_ID, so it cannot record itself as the step holding supersede."
+    exit 1
+  fi
+  claim="${BUILDKITE_BUILD_ID}/${BUILDKITE_STEP_ID}"
+  if ! claimed="$(env -u BUILDKITE_METADATA_BUILD_ID buildkite-agent meta-data get "fjall-deploy:supersede-step" --default "${claim}")"; then
+    echo "^^^ +++"
+    echo "Error: this build deployed nothing. The step holding supersede, fjall-deploy:supersede-step, could not be read. Retry this step."
+    exit 1
+  fi
+  if [ "${claimed}" != "${claim}" ] && [[ "${claimed}" == "${BUILDKITE_BUILD_ID}/"* ]]; then
+    echo "^^^ +++"
+    echo "Error: this build deployed nothing. Another step of this build already set supersede, and a second one would write over the deploy result the first one records. Set supersede on one deploy step per build."
+    exit 1
+  fi
+  if ! buildkite-agent meta-data set "fjall-deploy:supersede-step" "${claim}"; then
+    echo "^^^ +++"
+    echo "Error: this build deployed nothing. The step holding supersede could not be recorded in fjall-deploy:supersede-step. Retry this step."
+    exit 1
+  fi
 }
 
 # This build's creator's marker as the check's first word, read through the
@@ -596,6 +660,9 @@ supersede_marker_word() {
 
 if [ "${supersede}" = "true" ]; then
   echo "--- :fast_forward: Checking the deploys before and after this one"
+  if command -v buildkite-agent > /dev/null 2>&1; then
+    claim_supersede_step
+  fi
   if [ -n "${BUILDKITE_REBUILT_FROM_BUILD_NUMBER:-}" ]; then
     echo "supersede: deploying, a rebuild never skips or holds"
   elif ! command -v buildkite-agent > /dev/null 2>&1; then
@@ -623,6 +690,7 @@ if [ "${supersede}" = "true" ]; then
     echo "${supersede_line}"
     skip_line_pattern='^supersede: skipped for #([1-9][0-9]*) at ([0-9a-f]{40})$'
     held_line_pattern='^supersede: held by #([1-9][0-9]*), whose deploy result is ([a-z][a-z_-]{0,39}|[?])$'
+    overtaken_line_pattern='^supersede: overtaken by #([1-9][0-9]*), which is newer and started or recorded a deploy$'
     if [ "${supersede_status}" -eq 10 ] && [[ "${supersede_line}" =~ ${skip_line_pattern} ]]; then
       newer_number="${BASH_REMATCH[1]}"
       newer_commit="${BASH_REMATCH[2]}"
@@ -648,7 +716,9 @@ if [ "${supersede}" = "true" ]; then
       echo "supersede: holding, the result superseded could not be recorded, and the deploy before this one was never judged"
       hold_deploy ""
     elif [ "${supersede_status}" -eq 11 ] && [[ "${supersede_line}" =~ ${held_line_pattern} ]]; then
-      hold_deploy "${BASH_REMATCH[1]}"
+      hold_deploy "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    elif [ "${supersede_status}" -eq 11 ] && [[ "${supersede_line}" =~ ${overtaken_line_pattern} ]]; then
+      hold_overtaken "${BASH_REMATCH[1]}"
     elif [ "${supersede_status}" -eq 11 ] && [[ "${supersede_line}" == "supersede: holding, "* ]]; then
       hold_deploy ""
     elif [ "${supersede_status}" -eq 0 ] && [[ "${supersede_line}" == "supersede: deploying, "* ]]; then
@@ -716,6 +786,24 @@ run_cli() {
   fi
 }
 
+# With `supersede` set, the next marked build's hold reads this marker, the
+# job that started the deploy, against `fjall-deploy:result-job`, the job that
+# recorded the result. A retry is a new job, so a deploy whose result write is
+# lost, or whose job a timeout, a lost agent or a cancel ends first, then holds
+# that build instead of counting as no deploy or as an earlier attempt's
+# result. A deploy that cannot record the marker would count as none, so it
+# does not start. It is the last write before the CLI, so a step that fails
+# before it, as an install can, deployed nothing and reads that way.
+record_attempt="false"
+if [ "${supersede}" = "true" ] && command -v buildkite-agent > /dev/null 2>&1; then
+  record_attempt="true"
+  if [ -z "${BUILDKITE_JOB_ID:-}" ] || ! buildkite-agent meta-data set "fjall-deploy:started" "${BUILDKITE_JOB_ID}"; then
+    echo "^^^ +++"
+    echo "Error: this build deployed nothing. The fjall-deploy:started marker could not be recorded, and without it the next build would read a deploy that ends before recording its result as no deploy. Retry this step."
+    exit 1
+  fi
+fi
+
 log_file="$(mktemp)"
 start=$(date +%s)
 
@@ -746,9 +834,24 @@ else
 fi
 
 if command -v buildkite-agent > /dev/null 2>&1; then
-  # Best-effort reporting under set -e — a transient agent failure after a
-  # successful deploy must not replace the deploy's real exit status.
-  buildkite-agent meta-data set "fjall-deploy:result" "${result}" || true
+  # Without `supersede`, reporting is best effort under set -e, so a transient
+  # agent failure after a successful deploy does not replace the deploy's exit
+  # status. With it, the next marked build holds on a result this attempt did
+  # not record, so a deploy that succeeded fails its step, and a retry deploys
+  # the commit again and records its result. The result job is written after
+  # the result, so a lost second write reads as no result rather than as an
+  # earlier attempt's.
+  result_recorded="true"
+  if ! buildkite-agent meta-data set "fjall-deploy:result" "${result}"; then
+    result_recorded="false"
+  elif [ "${record_attempt}" = "true" ] && ! buildkite-agent meta-data set "fjall-deploy:result-job" "${BUILDKITE_JOB_ID}"; then
+    result_recorded="false"
+  fi
+  if [ "${record_attempt}" = "true" ] && [ "${result_recorded}" = "false" ] && [ "${exit_code}" -eq 0 ]; then
+    echo "^^^ +++"
+    echo "Error: the deploy succeeded, but its result could not be recorded, so the next marked build would hold on it. A retry of this step deploys this commit again and records its result."
+    exit_code=1
+  fi
   buildkite-agent meta-data set "fjall-deploy:duration" "${duration}" || true
   if [ -n "${token_line}" ]; then
     buildkite-agent meta-data set "fjall-deploy:approval-token" "${token_line#Approval token: }" || true
