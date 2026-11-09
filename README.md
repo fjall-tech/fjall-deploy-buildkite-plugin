@@ -174,10 +174,11 @@ After the run, the plugin records results as [build meta-data](https://buildkite
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `fjall-deploy:result`         | `success`, `plan-pending` (exit 2: the run stopped without failing — a plan with changes pending approval, a plan refused at the approval gate, or a run cancelled before it completed, which can follow a partial change), or `failure`. With `supersede` set, also `superseded` (exit 0, nothing deployed) |
 | `fjall-deploy:superseded-by`  | Set only with `superseded`. The number of the newer build whose deploy covers this one                                                                                                                                                                                                                       |
+| `fjall-deploy:held-by`        | Set only on a build held because the deploy before it did not succeed. The number of that build. A held build records no `fjall-deploy:result`. A later retry that deploys leaves it set                                                                                                                     |
 | `fjall-deploy:duration`       | Command duration in seconds                                                                                                                                                                                                                                                                                  |
 | `fjall-deploy:approval-token` | Token from a plan run with pending changes; feed back via `approval-token`                                                                                                                                                                                                                                   |
 
-A `superseded` build records no duration. It posts a warning annotation that names the newer build.
+A `superseded` build records no duration. It posts a warning annotation that names the newer build. A held build records no duration either, and posts an error annotation ([Holding after a failed deploy](#holding-after-a-failed-deploy)).
 
 A `plan-pending` result also posts a warning annotation (re-run instructions when the run printed an approval token, otherwise a note that the run stopped before it completed), and the step exits `2` so downstream steps can gate on it.
 
@@ -233,19 +234,44 @@ An empty `after`, `token-secret` or `barriers` item stops the step before anythi
 A build skips only when all of these hold.
 
 - Its creator marked it, by sending `"meta_data": {"fjall-deploy:supersedable": "true"}` in the body of its [create build](https://buildkite.com/docs/apis/rest-api/builds#create-a-build) request. A build started from the dashboard carries no marker, so a hand rollback always deploys.
-- It is a build of `main`, among the 20 newest `main` builds of its pipeline, and not a rebuild.
+- It is a build of `main`, among the 100 newest `main` builds of its pipeline, and not a rebuild.
 - The newest newer build that can still deploy, or has deployed, has passed its `after` step, and its commit has this build's commit in its first parent history. Such a build is running with `fjall-deploy:result` unset or `success`, or passed with `success`. A build that recorded anything else, `superseded` included, will not deploy its commit, so it is passed over.
 - No commit on that newer build's first parent line, from this build's commit up to the newer build's own, is a barrier. A merge commit on that line is judged by its diff against its first parent, which holds the net change of every commit it merged.
 
-Only that one newer build is judged. When it fails either of the last two checks, this build deploys rather than looking at an older one, so it never steps over a hand rollback.
+Only that one newer build is judged. When it fails either of the last two checks, this build does not skip, rather than looking at an older one, so it never steps over a hand rollback. A build whose own `fjall-deploy:result` already records anything but `superseded` or `success` never skips either, so the retry of a failed deploy never writes `superseded` over the failure.
 
 A commit on the newer build's first parent line is also a barrier when a line of its message starts with `deploy-alone`. That holds whenever `supersede` is set, with or without a `barriers` list. Only the messages of commits on that line are read. So when a merge commit or a squash lands your change on `main`, put the `deploy-alone` line in the message of the commit on `main`, at the very start of a line. The same line in a merged topic commit is not read.
 
-Any doubt deploys. The build deploys the commit it was given, as it would without `supersede`, when the secret cannot be read, a read of the builds list fails or runs past its bound (30 s a read, 120 s in all), git fails, or the clone is still shallow after `git fetch --unshallow`. The check prints one line that says whether it skipped and why. It runs without `FJALL_API_KEY` in its environment.
+Any doubt about a newer build deploys. A build its creator did not mark deploys the commit it was given, as it would without `supersede`, when the secret cannot be read, a read of the builds list fails or runs past its bound (30 s a read, 120 s in all), git fails, or the clone is still shallow after `git fetch --unshallow`. A marked build that cannot read the secret or the builds list holds instead ([Holding after a failed deploy](#holding-after-a-failed-deploy)). The check prints one line that says whether it skipped, held or deployed, and why. It runs without `FJALL_API_KEY` in its environment.
 
 `supersede` needs a plugin release that ships it, so the example above uses the moving major tag. An exact pin of an earlier release runs a hook that ignores `supersede` and deploys every build, and nothing warns that it did.
 
 An agent keeps the checkout it made for a plugin ref and does not fetch that ref again unless it sets `plugins-always-clone-fresh` (Buildkite's [agent configuration](https://buildkite.com/docs/agent/v3/configuration) docs). So an agent that cloned `v29` before `supersede` shipped runs the older hook, which ignores `supersede` and deploys every build. That is safe, and it ends when the agent next clones the plugin fresh.
+
+## Holding after a failed deploy
+
+A build its creator marked `fjall-deploy:supersedable`, which `supersede` judges, holds when the deploy before it did not succeed. A held build fails its step without installing the CLI, so it deploys nothing over a deploy that failed or stopped partway. It records no `fjall-deploy:result`, sets `fjall-deploy:held-by` to the number of the build that held it and posts an error annotation naming that build.
+
+The deploy before a build is the newest older `main` build on the same page of 100 whose `fjall-deploy:result` is set and is not `superseded`. A build with no result deployed nothing, so the check passes over it, and so a build that held passes the hold on to the next one. A build holds when that deploy recorded anything but `success`, including `plan-pending`, unless the build carries the marker `fjall-deploy:red-cleared` set to that deploy's number, which its creator sends beside `fjall-deploy:supersedable`.
+
+```json
+{
+  "meta_data": {
+    "fjall-deploy:supersedable": "true",
+    "fjall-deploy:red-cleared": "528"
+  }
+}
+```
+
+A creator sets `fjall-deploy:red-cleared` only once a person has judged that deploy safe to build on. A build with no deploy before it on a page shorter than 100 deploys, since that page holds the pipeline's whole history.
+
+The check judges a skip first, because a skip deploys nothing. A marked build holds on any doubt, as an unmarked one deploys on it. That covers a secret or builds list it cannot read, a deploy before it that lies past the page, and a check that stops without a verdict. The hook reads the marker through `buildkite-agent meta-data get`, so it holds a marked build even when the builds list cannot be read. When that read fails, the build holds on any doubt, and once the builds list is read, the build's own entry there says whether it is marked, so a hand build still deploys.
+
+A rebuild never holds, and a build started from the dashboard carries no marker. To clear a hold, retry the deploy step of the build named in `fjall-deploy:held-by` until it passes, then retry the held step. A retry that gets past the check removes the error annotation. To deploy over the failed deploy anyway, Rebuild the held build.
+
+The check reads results only, never a job's state. A deploy that a lost agent, a step timeout or a cancelled job ended before the hook recorded its result counts as no deploy, and the check judges the build below it. The check does not wait for an older build that has not reached its deploy step, such as one stopped at a block step, so give every deploy step one concurrency group ([Serialising Deploys](#serialising-deploys)).
+
+An agent that cloned the plugin before the hold shipped runs a hook that never holds, until it next clones the plugin fresh.
 
 ## Examples
 

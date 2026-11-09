@@ -547,37 +547,93 @@ install_step() {
 
 plugin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Skip this deploy when a newer deploy build already carries its commit. The
-# decision is supersede-check.mjs's, and only its positive proof skips. Every
-# other outcome falls through to the deploy. The module runs through
+# Skip this deploy when a newer deploy build already carries its commit, and
+# hold it when its creator marked it and the deploy before it did not succeed.
+# Both decisions are supersede-check.mjs's. Only its positive proof skips, and
+# a marked build deploys only on its positive proof. Every other outcome holds
+# a marked build and deploys an unmarked one. The module runs through
 # install_step, so it never holds the deploy token, and it takes the read
 # token on stdin, never argv or env.
+#
+# A held build deployed nothing and records no `fjall-deploy:result`, so the
+# next marked build passes over it to the same red build. `$1` is the red
+# build's number, or empty when the check could not judge the deploy before
+# this one.
+hold_deploy() {
+  local held_by="$1" red_build message
+  if [ -n "${held_by}" ]; then
+    buildkite-agent meta-data set "fjall-deploy:held-by" "${held_by}" || true
+    red_build="#${held_by}"
+    if [ -n "${BUILDKITE_BUILD_URL:-}" ]; then
+      red_build="[#${held_by}](${BUILDKITE_BUILD_URL%/*}/${held_by})"
+    fi
+    message="This build deployed nothing. Build ${red_build}, the deploy before it, did not succeed, so this one would deploy over it. Retry that build's deploy step until it passes, then retry this one. To deploy over it anyway, Rebuild this build, which never holds."
+  else
+    message="This build deployed nothing. The check could not prove that the deploy before it succeeded. Retry this step. To deploy anyway, Rebuild this build, which never holds."
+  fi
+  buildkite-agent annotate --style error --context fjall-deploy-held "${message}" || true
+  echo "^^^ +++"
+  exit 1
+}
+
+# This build's creator's marker as the check's first word, read through the
+# job's own agent rather than the builds list, so a marked build holds even
+# when the list cannot be read. A read that fails prints `unknown`, which
+# holds on any doubt and leaves the build's own entry in the builds list to
+# say whether it is marked, so a hand build still deploys once the list is
+# read. The read drops BUILDKITE_METADATA_BUILD_ID, which `get` would
+# otherwise take as a `--build` naming another build.
+supersede_marker_word() {
+  local marker
+  if ! marker="$(env -u BUILDKITE_METADATA_BUILD_ID buildkite-agent meta-data get "fjall-deploy:supersedable" --default "false")"; then
+    echo "unknown"
+  elif [ "${marker}" = "true" ]; then
+    echo "marked"
+  else
+    echo "unmarked"
+  fi
+}
+
 if [ "${supersede}" = "true" ]; then
-  echo "--- :fast_forward: Checking for a newer deploy that carries this commit"
+  echo "--- :fast_forward: Checking the deploys before and after this one"
   if [ -n "${BUILDKITE_REBUILT_FROM_BUILD_NUMBER:-}" ]; then
-    echo "supersede: deploying, a rebuild never skips"
+    echo "supersede: deploying, a rebuild never skips or holds"
   elif ! command -v buildkite-agent > /dev/null 2>&1; then
     echo "supersede: deploying, buildkite-agent is not on this agent's PATH"
   elif ! supersede_token="$(buildkite-agent secret get "${supersede_token_secret}")" || [ -z "${supersede_token}" ]; then
+    supersede_marked="$(supersede_marker_word)"
+    if [ "${supersede_marked}" = "marked" ]; then
+      echo "supersede: holding, the supersede.token-secret secret could not be read"
+      hold_deploy ""
+    elif [ "${supersede_marked}" = "unknown" ]; then
+      echo "supersede: holding, neither this build's fjall-deploy:supersedable marker nor the supersede.token-secret secret could be read"
+      hold_deploy ""
+    fi
     echo "supersede: deploying, the supersede.token-secret secret could not be read"
   else
+    supersede_marked="$(supersede_marker_word)"
+    if [ "${supersede_marked}" = "unknown" ]; then
+      echo "supersede: this build's fjall-deploy:supersedable marker could not be read, so its entry in the builds list says whether it is marked"
+    fi
     set +e
-    supersede_line="$(printf '%s' "${supersede_token}" | install_step node "${plugin_dir}/supersede-check.mjs" "${supersede_after}" ${supersede_barriers[@]+"${supersede_barriers[@]}"})"
+    supersede_line="$(printf '%s' "${supersede_token}" | install_step node "${plugin_dir}/supersede-check.mjs" "${supersede_marked}" "${supersede_after}" ${supersede_barriers[@]+"${supersede_barriers[@]}"})"
     supersede_status=$?
     set -e
     supersede_token=""
     echo "${supersede_line}"
     skip_line_pattern='^supersede: skipped for #([1-9][0-9]*) at ([0-9a-f]{40})$'
+    held_line_pattern='^supersede: held by #([1-9][0-9]*), whose deploy result is ([a-z][a-z_-]{0,39}|[?])$'
     if [ "${supersede_status}" -eq 10 ] && [[ "${supersede_line}" =~ ${skip_line_pattern} ]]; then
       newer_number="${BASH_REMATCH[1]}"
       newer_commit="${BASH_REMATCH[2]}"
-      # The result is written first, and a skip that cannot record it deploys.
-      # A build that deployed nothing with no `superseded` on it would send its
-      # readers looking for a deploy of this commit that never happens.
+      # The result is written first. A build that skipped with no
+      # `superseded` on it would send its readers looking for a deploy of this
+      # commit that never happens. A skip that cannot record it holds, since
+      # only a marked build skips and its hold was never judged.
       # `meta-data set` writes to the build of `--job`, which defaults to
       # BUILDKITE_JOB_ID, a standard variable a build's env cannot override.
       # Unlike `get` it has no `--build`, so adding one would fail this write
-      # and turn every skip into a deploy.
+      # and turn every skip into a hold.
       if buildkite-agent meta-data set "fjall-deploy:result" "superseded"; then
         buildkite-agent meta-data set "fjall-deploy:superseded-by" "${newer_number}" || true
         newer_build="#${newer_number}"
@@ -589,10 +645,25 @@ if [ "${supersede}" = "true" ]; then
           "This build deployed nothing. Build ${newer_build}, at \`${newer_commit:0:9}\`, is newer, has passed its \`${supersede_after}\` step and carries this build's commit \`${own_commit:0:9}\`, so its deploy covers this one." || true
         exit 0
       fi
-      echo "supersede: deploying, the result superseded could not be recorded"
+      echo "supersede: holding, the result superseded could not be recorded, and the deploy before this one was never judged"
+      hold_deploy ""
+    elif [ "${supersede_status}" -eq 11 ] && [[ "${supersede_line}" =~ ${held_line_pattern} ]]; then
+      hold_deploy "${BASH_REMATCH[1]}"
+    elif [ "${supersede_status}" -eq 11 ] && [[ "${supersede_line}" == "supersede: holding, "* ]]; then
+      hold_deploy ""
+    elif [ "${supersede_status}" -eq 0 ] && [[ "${supersede_line}" == "supersede: deploying, "* ]]; then
+      :
+    elif [ "${supersede_marked}" != "unmarked" ]; then
+      echo "supersede: holding, the check exited ${supersede_status} with no verdict this hook reads"
+      hold_deploy ""
     elif [ "${supersede_status}" -ne 0 ]; then
       echo "supersede: deploying, the check exited ${supersede_status}"
     fi
+  fi
+  # A retry that gets this far clears the hold annotation an earlier attempt
+  # posted. Its fjall-deploy:held-by stays, since meta-data cannot be unset.
+  if [ "${BUILDKITE_RETRY_COUNT:-0}" != "0" ]; then
+    buildkite-agent annotation remove --context fjall-deploy-held > /dev/null 2>&1 || true
   fi
 fi
 

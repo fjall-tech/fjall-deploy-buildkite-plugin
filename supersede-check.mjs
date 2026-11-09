@@ -2,32 +2,53 @@
 /**
  * Decide whether this deploy build may skip itself because a newer deploy
  * build of the same pipeline carries its commit (the plugin's `supersede`
- * property). Only positive proof skips. Every failure, refusal or doubt
- * deploys the commit this build was given, which is what the plugin did
- * before `supersede` existed.
+ * property), and whether a build its creator marked must hold because the
+ * deploy before it did not succeed. Only positive proof skips, and for a
+ * marked build only positive proof deploys. Every failure, refusal or doubt
+ * deploys an unmarked build, which is what the plugin did before `supersede`
+ * existed, and holds a marked one.
  *
- *   node supersede-check.mjs <after> [<barrier>...]   (the read token on stdin)
+ *   node supersede-check.mjs <marked|unmarked|unknown> <after> [<barrier>...]
  *
- * It reads BUILDKITE_ORGANIZATION_SLUG, BUILDKITE_PIPELINE_SLUG,
- * BUILDKITE_BUILD_NUMBER and BUILDKITE_COMMIT, and prints exactly one line,
- * either `supersede: skipped for #<n> at <sha>` with exit code 10, or
+ * The read token arrives on stdin. The first word is the hook's own read of
+ * this build's `fjall-deploy:supersedable` marker. `unknown`, or any word but
+ * the other two, means the hook could not read it. Then a doubt holds, and
+ * once the builds list is read, this build's own entry there says whether it
+ * is marked. It reads BUILDKITE_ORGANIZATION_SLUG,
+ * BUILDKITE_PIPELINE_SLUG, BUILDKITE_BUILD_NUMBER and BUILDKITE_COMMIT, and
+ * prints exactly one line, `supersede: skipped for #<n> at <sha>` with exit
+ * code 10, `supersede: held by #<n>, whose deploy result is <word>` or
+ * `supersede: holding, <reason>` with exit code 11, or
  * `supersede: deploying, <reason>` with exit code 0. It never prints a
  * response body, the token or an environment value.
  *
  * This build X, at commit x, skips only when all of these hold.
  *
- * 1. One page of the pipeline's 20 newest `main` builds, read with the token,
+ * 1. One page of the pipeline's 100 newest `main` builds, read with the token,
  *    is newest first, holds only `main` builds and reaches X, and X's own
  *    entry carries the creator's marker `fjall-deploy:supersedable` = `true`.
  * 2. Y, the newest build above X that is running with `fjall-deploy:result`
  *    unset or `success`, or passed with it `success`, exists. If Y then fails
- *    a check, X deploys without looking further back.
+ *    a check, X does not skip, and looks no further back for another Y.
  * 3. Y's commit y is a full sha, and Y has exactly one job keyed `<after>`,
  *    which passed.
  * 4. x has a parent and is on y's first parent line, and no commit from y
  *    down to x, both included, is a barrier. A barrier's diff against its
  *    first parent touches a `<barrier>` path, read literally, or its message
  *    has a line starting `deploy-alone`.
+ *
+ * X never skips when its own `fjall-deploy:result` is already set to anything
+ * but `superseded` or `success`, since only a retry of a deploy that did not
+ * succeed carries one, and a skip would write over it the result that names
+ * that deploy red.
+ *
+ * A marked X that does not skip deploys only when P, the newest build below X
+ * on the page whose `fjall-deploy:result` is set and is not `superseded`,
+ * recorded `success`, or X's entry carries the creator's marker
+ * `fjall-deploy:red-cleared` = P's number. A build with no result deployed
+ * nothing, so it is passed over, as webapp's deploy-decide.jq passes it over.
+ * With no P, X deploys only when the page is shorter than its size, since
+ * such a page is the pipeline's whole history.
  *
  * It stands alone like resolve-fjall-engine.mjs. The plugin ships with no
  * node_modules, so it imports only Node's own modules.
@@ -37,9 +58,11 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 export const SKIP_EXIT_CODE = 10;
+export const HOLD_EXIT_CODE = 11;
 export const SUPERSEDABLE_KEY = "fjall-deploy:supersedable";
+export const RED_CLEARED_KEY = "fjall-deploy:red-cleared";
 export const RESULT_KEY = "fjall-deploy:result";
-const PAGE_SIZE = 20;
+export const PAGE_SIZE = 100;
 const MAX_RANGE = 1000;
 const DEFAULT_LIMITS = Object.freeze({
   readMs: 30_000,
@@ -91,9 +114,26 @@ function isEligible(build) {
 }
 
 const deploy = (reason) => ({ kind: "deploy", reason });
+const holding = (reason) => ({ kind: "holding", reason });
+
+/**
+ * What a doubt does. Only an explicit `false` deploys, so a caller that
+ * passed no marker, or could not read it, holds rather than deploying a build
+ * it never judged.
+ */
+function unproven(marked, reason) {
+  return marked === false ? deploy(reason) : holding(reason);
+}
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A result as webapp's deploy-decide.jq names one, `?` unless a short word. */
+function resultWord(value) {
+  return typeof value === "string" && /^[a-z][a-z_-]{0,39}$/.test(value)
+    ? value
+    : "?";
 }
 
 function boundReason(limits) {
@@ -187,10 +227,10 @@ async function readBuildsPage({
   }
 }
 
-/** Rules 1 to 3, over the page. Returns Y or the reason to deploy. */
-function judgePage(builds, { number, commit, after }) {
+/** Rule 1's shape, over the page. Returns X's place or the doubt. */
+function readPage(builds, number) {
   if (!Array.isArray(builds) || builds.length === 0) {
-    return deploy("the builds answer was not a non-empty list");
+    return { ok: false, reason: "the builds answer was not a non-empty list" };
   }
   for (const build of builds) {
     if (
@@ -198,28 +238,64 @@ function judgePage(builds, { number, commit, after }) {
       !Number.isSafeInteger(build.number) ||
       typeof build.branch !== "string"
     ) {
-      return deploy("a build on the page has no number or branch");
+      return {
+        ok: false,
+        reason: "a build on the page has no number or branch",
+      };
     }
   }
   for (let i = 1; i < builds.length; i += 1) {
     if (builds[i].number >= builds[i - 1].number) {
-      return deploy("the builds page is not newest first");
+      return { ok: false, reason: "the builds page is not newest first" };
     }
   }
   if (builds.some((build) => build.branch !== "main")) {
-    return deploy("the builds page holds a build that is not on main");
+    return {
+      ok: false,
+      reason: "the builds page holds a build that is not on main",
+    };
   }
   const ownIndex = builds.findIndex((build) => build.number === number);
   if (ownIndex === -1) {
-    return deploy(
-      builds[builds.length - 1].number > number
-        ? `the ${builds.length} newest main builds do not reach this build`
-        : "this build is not on the page of main builds",
-    );
+    return {
+      ok: false,
+      reason:
+        builds[builds.length - 1].number > number
+          ? `the ${builds.length} newest main builds do not reach this build`
+          : "this build is not on the page of main builds",
+    };
   }
+  return { ok: true, ownIndex };
+}
+
+function carriesMarker(build) {
+  return (
+    isRecord(build.meta_data) && build.meta_data[SUPERSEDABLE_KEY] === "true"
+  );
+}
+
+/** The red result a retry of this build carries, or undefined. */
+function ownRedResult(own) {
+  if (!isRecord(own.meta_data) || !Object.hasOwn(own.meta_data, RESULT_KEY)) {
+    return undefined;
+  }
+  const result = own.meta_data[RESULT_KEY];
+  return result === "" || result === "superseded" || result === "success"
+    ? undefined
+    : resultWord(result);
+}
+
+/** The rest of rules 1 to 3. Returns Y or the reason not to skip. */
+function judgeNewer(builds, ownIndex, { commit, after }) {
   const own = builds[ownIndex];
-  if (!isRecord(own.meta_data) || own.meta_data[SUPERSEDABLE_KEY] !== "true") {
+  if (!carriesMarker(own)) {
     return deploy(`this build carries no ${SUPERSEDABLE_KEY} marker`);
+  }
+  const red = ownRedResult(own);
+  if (red !== undefined) {
+    return deploy(
+      `this build already recorded the deploy result ${red}, so its retry never skips`,
+    );
   }
   if (own.commit !== commit) {
     return deploy("this build's page entry names another commit");
@@ -249,6 +325,40 @@ function judgePage(builds, { number, commit, after }) {
     );
   }
   return { kind: "candidate", number: newer.number, commit: newer.commit };
+}
+
+/**
+ * The deploy before a marked X, for a build that did not skip. `reason` is
+ * why it did not skip, kept as the deploy line's reason.
+ */
+function judgeBefore(builds, ownIndex, reason) {
+  const own = builds[ownIndex];
+  for (const build of builds.slice(ownIndex + 1)) {
+    if (build.meta_data === null || build.meta_data === undefined) continue;
+    if (!isRecord(build.meta_data)) {
+      return holding(`build #${build.number}'s meta-data is not an object`);
+    }
+    const result = Object.hasOwn(build.meta_data, RESULT_KEY)
+      ? build.meta_data[RESULT_KEY]
+      : "";
+    if (result === "" || result === "superseded") continue;
+    if (result === "success") return deploy(reason);
+    const word = resultWord(result);
+    if (
+      isRecord(own.meta_data) &&
+      own.meta_data[RED_CLEARED_KEY] === String(build.number)
+    ) {
+      return deploy(
+        `${reason}, and this build's ${RED_CLEARED_KEY} marker clears build #${build.number}'s ${word}`,
+      );
+    }
+    return { kind: "held", number: build.number, result: word };
+  }
+  return builds.length < PAGE_SIZE
+    ? deploy(reason)
+    : holding(
+        `no build below this one on the page of ${PAGE_SIZE} recorded a deploy result`,
+      );
 }
 
 /**
@@ -445,12 +555,18 @@ async function judgeHistory({ cwd, x, y, barriers, deadline, limits }) {
 
 /**
  * The whole decision. `env` carries the four Buildkite names, `token` is the
- * read token and `cwd` is the checkout. Resolves to `{ kind: "skip", number,
- * commit }` or `{ kind: "deploy", reason }`, and never rejects.
+ * read token, `marked` is the hook's read of this build's marker and `cwd` is
+ * the checkout. Only `marked: false` lets a doubt deploy. With `marked` left
+ * undefined, because the hook could not read it, a doubt holds and the page
+ * entry's marker decides the rest. Resolves to
+ * `{ kind: "skip", number, commit }`, `{ kind: "held", number, result }`,
+ * `{ kind: "holding", reason }` or `{ kind: "deploy", reason }`, and never
+ * rejects.
  */
 export async function decide({
   env,
   token,
+  marked,
   after,
   barriers,
   cwd,
@@ -458,12 +574,13 @@ export async function decide({
   limits = DEFAULT_LIMITS,
 }) {
   const deadline = Date.now() + limits.totalMs;
+  const doubt = (reason) => unproven(marked, reason);
   if (typeof after !== "string" || after === "") {
-    return deploy("supersede.after is empty");
+    return doubt("supersede.after is empty");
   }
   for (const barrier of barriers) {
     const problem = barrierProblem(barrier);
-    if (problem !== undefined) return deploy(`a barrier ${problem}`);
+    if (problem !== undefined) return doubt(`a barrier ${problem}`);
   }
   const org = env.BUILDKITE_ORGANIZATION_SLUG;
   const pipeline = env.BUILDKITE_PIPELINE_SLUG;
@@ -473,20 +590,20 @@ export async function decide({
     !SLUG.test(org) ||
     !SLUG.test(pipeline)
   ) {
-    return deploy(
+    return doubt(
       "the organisation or pipeline slug is off Buildkite's grammar",
     );
   }
   const rawNumber = env.BUILDKITE_BUILD_NUMBER;
   if (typeof rawNumber !== "string" || !BUILD_NUMBER.test(rawNumber)) {
-    return deploy("this build's number is not a build number");
+    return doubt("this build's number is not a build number");
   }
   const x = env.BUILDKITE_COMMIT;
   if (typeof x !== "string" || !FULL_SHA.test(x)) {
-    return deploy("this build's commit is not a full sha");
+    return doubt("this build's commit is not a full sha");
   }
   if (typeof token !== "string" || !TOKEN.test(token)) {
-    return deploy("the read token is empty or not one printable word");
+    return doubt("the read token is empty or not one printable word");
   }
 
   const page = await readBuildsPage({
@@ -497,34 +614,66 @@ export async function decide({
     limits,
     deadline,
   });
-  if (!page.ok) return deploy(page.reason);
-  const judged = judgePage(page.builds, {
-    number: Number.parseInt(rawNumber, 10),
-    commit: x,
-    after,
-  });
-  if (judged.kind !== "candidate") return judged;
+  if (!page.ok) return doubt(page.reason);
+  const { builds } = page;
+  const placed = readPage(builds, Number.parseInt(rawNumber, 10));
+  if (!placed.ok) return doubt(placed.reason);
+  const { ownIndex } = placed;
 
-  const refusal = await judgeHistory({
-    cwd,
-    x,
-    y: judged.commit,
-    barriers,
-    deadline,
-    limits,
-  });
-  if (refusal !== undefined) return deploy(refusal);
-  return { kind: "skip", number: judged.number, commit: judged.commit };
+  // The skip comes first. It deploys nothing, so it needs no hold.
+  const judged = judgeNewer(builds, ownIndex, { commit: x, after });
+  let reason;
+  if (judged.kind === "candidate") {
+    const refusal = await judgeHistory({
+      cwd,
+      x,
+      y: judged.commit,
+      barriers,
+      deadline,
+      limits,
+    });
+    if (refusal === undefined) {
+      return { kind: "skip", number: judged.number, commit: judged.commit };
+    }
+    reason = refusal;
+  } else {
+    reason = judged.reason;
+  }
+  if (marked !== true && !carriesMarker(builds[ownIndex])) {
+    return deploy(reason);
+  }
+  return judgeBefore(builds, ownIndex, reason);
 }
 
-/** The one line the hook reads, and the exit code it reads beside it. */
+/**
+ * The one line the hook reads, and the exit code it reads beside it. A kind
+ * this does not know holds, so no verdict deploys by default.
+ */
 export function verdictLine(verdict) {
-  return verdict.kind === "skip"
-    ? {
+  switch (verdict.kind) {
+    case "skip":
+      return {
         line: `supersede: skipped for #${verdict.number} at ${verdict.commit}`,
         code: SKIP_EXIT_CODE,
-      }
-    : { line: `supersede: deploying, ${verdict.reason}`, code: 0 };
+      };
+    case "held":
+      return {
+        line: `supersede: held by #${verdict.number}, whose deploy result is ${verdict.result}`,
+        code: HOLD_EXIT_CODE,
+      };
+    case "holding":
+      return {
+        line: `supersede: holding, ${verdict.reason}`,
+        code: HOLD_EXIT_CODE,
+      };
+    case "deploy":
+      return { line: `supersede: deploying, ${verdict.reason}`, code: 0 };
+    default:
+      return {
+        line: "supersede: holding, the check reached no verdict",
+        code: HOLD_EXIT_CODE,
+      };
+  }
 }
 
 /** Reads the token from stdin, bounded in size and time. */
@@ -555,15 +704,23 @@ function readStdin(stream, timeoutMs) {
   });
 }
 
-async function main() {
-  const [after, ...barriers] = process.argv.slice(2);
+/** The hook's first word, `true`, `false`, or undefined when it read nothing. */
+function markerFromWord(word) {
+  if (word === "marked") return true;
+  if (word === "unmarked") return false;
+  return undefined;
+}
+
+async function main(marked) {
+  const [, after, ...barriers] = process.argv.slice(2);
   const token = await readStdin(process.stdin, DEFAULT_LIMITS.readMs);
   if (token === undefined) {
-    return deploy("the read token did not arrive on stdin");
+    return unproven(marked, "the read token did not arrive on stdin");
   }
   return decide({
     env: process.env,
     token: token.replace(/\r?\n$/, ""),
+    marked,
     after,
     barriers,
     cwd: process.cwd(),
@@ -575,7 +732,7 @@ async function main() {
  * resolve-fjall-engine.mjs decides it. The plugin ships standalone, so it
  * cannot import the repository's helper. Any failure to realpath either path
  * reads as not started, and the hook reads a run that printed no line as
- * deploying.
+ * deploying an unmarked build and holding a marked one.
  */
 function isInvokedDirectly() {
   if (process.argv[1] === undefined) return false;
@@ -590,11 +747,13 @@ function isInvokedDirectly() {
 }
 
 if (isInvokedDirectly()) {
+  const marked = markerFromWord(process.argv[2]);
   let verdict;
   try {
-    verdict = await main();
+    verdict = await main(marked);
   } catch (err) {
-    verdict = deploy(
+    verdict = unproven(
+      marked,
       `the check stopped on ${err instanceof Error ? err.name : "a non-error"}`,
     );
   }

@@ -1645,8 +1645,9 @@ PATH"
   refute_output --partial "Installing fjall"
 }
 
-# A deploy build skips itself when a newer deploy build carries its commit.
-# supersede-check.mjs makes that decision, under its own suite
+# A deploy build skips itself when a newer deploy build carries its commit,
+# and a build its creator marked holds while the deploy before it is red.
+# supersede-check.mjs makes both decisions, under its own suite
 # (supersedeCheck.test.ts in @fjall/cli). Node is stubbed here, so these tests
 # pin only what the hook does around the decision. That is what it reads, what
 # it hands the module and what it records.
@@ -1662,14 +1663,24 @@ supersede_config() {
 }
 
 # Drains setup()'s one-line node plan and replaces it with the version check
-# and one start of the module, whose plan line runs $1.
+# and one start of the module, whose plan line runs $1. $2 is the marker word
+# the hook must hand the module, marked unless given.
 stub_supersede_module() {
   node --version > /dev/null
   unstub node
   stub node \
     "--version : echo 'v${HOOK_NODE_VERSION}'" \
-    "* verify-ci-green prisma/migrations/ : $1"
+    "* ${2:-marked} verify-ci-green prisma/migrations/ : $1"
 }
+
+# The token secret's read, which every test that reaches it answers. Named
+# apart from the answer, so no line spells a token name beside a value.
+SECRET_GET="secret get CI_GREEN_API_TOKEN"
+
+# The hook's read of its own build's marker, which comes after the token's.
+MARKED_READ="meta-data get fjall-deploy:supersedable --default false : echo true"
+UNMARKED_READ="meta-data get fjall-deploy:supersedable --default false : echo false"
+MARKER_READ_FAILS="meta-data get fjall-deploy:supersedable --default false : exit 1"
 
 @test "supersede absent: the hook reads no token and starts no check" {
   # The buildkite-agent plan is exactly the deploy's two writes, and node's is
@@ -1688,7 +1699,7 @@ stub_supersede_module() {
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
 }
 
-@test "supersede on a rebuild deploys without reading the token" {
+@test "supersede on a rebuild deploys without reading the marker or the token" {
   stub buildkite-agent \
     "meta-data set fjall-deploy:result success : true" \
     "meta-data set fjall-deploy:duration * : true"
@@ -1700,7 +1711,7 @@ stub_supersede_module() {
   unstub buildkite-agent
   unstub node
   assert_success
-  assert_output --partial "supersede: deploying, a rebuild never skips"
+  assert_output --partial "supersede: deploying, a rebuild never skips or holds"
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
 }
 
@@ -1708,7 +1719,8 @@ stub_supersede_module() {
   stub_supersede_module "echo 'supersede: skipped for #530 at ${SUPERSEDE_NEWER_COMMIT}'; exit 10"
   # bats-mock consumes a plan in order, so unstub pins the write order too.
   stub buildkite-agent \
-    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
     "meta-data set fjall-deploy:result superseded : echo 'RESULT_SET'" \
     "meta-data set fjall-deploy:superseded-by 530 : echo 'SUPERSEDED_BY_SET'" \
     "annotate --style warning --context fjall-deploy-superseded * : printf 'ANNOTATION:%s\n' \"\$6\""
@@ -1726,27 +1738,29 @@ stub_supersede_module() {
   refute_output --partial "ci run"
 }
 
-@test "supersede skip whose superseded result cannot be written deploys instead" {
+@test "supersede skip whose superseded result cannot be written holds, since its hold was never judged" {
   stub_supersede_module "echo 'supersede: skipped for #530 at ${SUPERSEDE_NEWER_COMMIT}'; exit 10"
   stub buildkite-agent \
-    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
     "meta-data set fjall-deploy:result superseded : exit 1" \
-    "meta-data set fjall-deploy:result success : true" \
-    "meta-data set fjall-deploy:duration * : true"
+    "annotate --style error --context fjall-deploy-held * : true"
   supersede_config
 
   run "$PWD/hooks/command"
 
   unstub buildkite-agent
-  assert_success
-  assert_output --partial "supersede: deploying, the result superseded could not be recorded"
-  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+  assert_failure
+  assert_output --partial "supersede: holding, the result superseded could not be recorded"
+  refute_output --partial "Installing fjall"
+  refute_output --partial "ci run"
 }
 
 @test "supersede skip still exits 0 when superseded-by and the annotation fail" {
   stub_supersede_module "echo 'supersede: skipped for #530 at ${SUPERSEDE_NEWER_COMMIT}'; exit 10"
   stub buildkite-agent \
-    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
     "meta-data set fjall-deploy:result superseded : true" \
     "meta-data set fjall-deploy:superseded-by 530 : exit 1" \
     "annotate --style warning --context fjall-deploy-superseded * : exit 1"
@@ -1763,7 +1777,8 @@ stub_supersede_module() {
 @test "supersede starts the module without FJALL_API_KEY, with the token on stdin" {
   stub_supersede_module "if [ -n \"\${FJALL_API_KEY+set}\" ]; then echo 'KEY_PRESENT' >&2; else echo 'KEY_ABSENT' >&2; fi; IFS= read -r token || true; if [ \"\$token\" = 'bkua_bats' ]; then echo 'TOKEN_ON_STDIN' >&2; fi; echo \"MODULE:\${1##*/}\" >&2; echo 'supersede: deploying, no newer main build can still deploy or has deployed'"
   stub buildkite-agent \
-    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
     "meta-data set fjall-deploy:result success : true" \
     "meta-data set fjall-deploy:duration * : true"
   supersede_config
@@ -1780,10 +1795,130 @@ stub_supersede_module() {
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
 }
 
-@test "supersede whose check exits on an error deploys" {
+@test "supersede hands an unmarked build's check the word unmarked" {
+  stub_supersede_module "echo 'supersede: deploying, this build carries no fjall-deploy:supersedable marker'" unmarked
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${UNMARKED_READ}" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  assert_output --partial "supersede: deploying, this build carries no fjall-deploy:supersedable marker"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede held by a red build records held-by and an error annotation, records no result and installs nothing" {
+  stub_supersede_module "echo 'supersede: held by #528, whose deploy result is failure'; exit 11"
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "meta-data set fjall-deploy:held-by 528 : echo 'HELD_BY_SET'" \
+    "annotate --style error --context fjall-deploy-held * : printf 'ANNOTATION:%s\n' \"\$6\""
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_output --partial "supersede: held by #528, whose deploy result is failure"
+  assert_output --partial "HELD_BY_SET"
+  assert_output --partial "ANNOTATION:This build deployed nothing. Build [#528](https://buildkite.com/acme/webapp-deploy/builds/528), the deploy before it, did not succeed"
+  refute_output --partial "Installing fjall"
+  refute_output --partial "ci run"
+}
+
+@test "supersede held by a build whose result is not a word reads the ? the check prints" {
+  stub_supersede_module "echo 'supersede: held by #528, whose deploy result is ?'; exit 11"
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "meta-data set fjall-deploy:held-by 528 : echo 'HELD_BY_SET'" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_output --partial "HELD_BY_SET"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede holding on doubt posts the annotation, sets no held-by and installs nothing" {
+  stub_supersede_module "echo 'supersede: holding, the builds read timed out'; exit 11"
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "annotate --style error --context fjall-deploy-held * : printf 'ANNOTATION:%s\n' \"\$6\""
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_output --partial "supersede: holding, the builds read timed out"
+  assert_output --partial "ANNOTATION:This build deployed nothing. The check could not prove that the deploy before it succeeded."
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede holds an unmarked build its check holds, since the check read the marker on the page" {
+  stub_supersede_module "echo 'supersede: held by #528, whose deploy result is failure'; exit 11" unmarked
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${UNMARKED_READ}" \
+    "meta-data set fjall-deploy:held-by 528 : true" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede holds a marked build whose check exits on an error" {
   stub_supersede_module "exit 1"
   stub buildkite-agent \
-    "secret get CI_GREEN_API_TOKEN : echo 'bkua_bats'" \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_output --partial "supersede: holding, the check exited 1 with no verdict this hook reads"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede holds a marked build whose check exits 0 with no deploying line" {
+  stub_supersede_module "true"
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_output --partial "supersede: holding, the check exited 0 with no verdict this hook reads"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede deploys an unmarked build whose check exits on an error" {
+  stub_supersede_module "exit 1" unmarked
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${UNMARKED_READ}" \
     "meta-data set fjall-deploy:result success : true" \
     "meta-data set fjall-deploy:duration * : true"
   supersede_config
@@ -1796,9 +1931,10 @@ stub_supersede_module() {
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
 }
 
-@test "supersede with an unreadable token secret deploys and says why" {
+@test "supersede deploys an unmarked build whose token secret cannot be read, and says why" {
   stub buildkite-agent \
-    "secret get CI_GREEN_API_TOKEN : exit 1" \
+    "${SECRET_GET} : exit 1" \
+    "${UNMARKED_READ}" \
     "meta-data set fjall-deploy:result success : true" \
     "meta-data set fjall-deploy:duration * : true"
   supersede_config
@@ -1810,6 +1946,138 @@ stub_supersede_module() {
   assert_success
   assert_output --partial "supersede: deploying, the supersede.token-secret secret could not be read"
   assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede holds a marked build whose token secret cannot be read" {
+  stub buildkite-agent \
+    "${SECRET_GET} : exit 1" \
+    "${MARKED_READ}" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_failure
+  assert_output --partial "supersede: holding, the supersede.token-secret secret could not be read"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede hands the check the word unknown when this build's marker cannot be read, and deploys on its verdict" {
+  stub_supersede_module "echo 'supersede: deploying, this build carries no fjall-deploy:supersedable marker'" unknown
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKER_READ_FAILS}" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  assert_output --partial "supersede: this build's fjall-deploy:supersedable marker could not be read, so its entry in the builds list says whether it is marked"
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede holds a build whose marker cannot be read when its check exits on an error" {
+  stub_supersede_module "exit 1" unknown
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKER_READ_FAILS}" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_output --partial "supersede: holding, the check exited 1 with no verdict this hook reads"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede holds when neither this build's marker nor the token secret can be read" {
+  stub buildkite-agent \
+    "${SECRET_GET} : exit 1" \
+    "${MARKER_READ_FAILS}" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_failure
+  assert_output --partial "supersede: holding, neither this build's fjall-deploy:supersedable marker nor the supersede.token-secret secret could be read"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede holds a marked build whose check exits 10 with a line that is not a skip" {
+  stub_supersede_module "echo 'supersede: skipped for #530'; exit 10"
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_output --partial "supersede: holding, the check exited 10 with no verdict this hook reads"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede holds a marked build whose check exits 11 with a line that is not a hold" {
+  stub_supersede_module "echo 'supersede: deploying, no newer main build can still deploy or has deployed'; exit 11"
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "annotate --style error --context fjall-deploy-held * : true"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_output --partial "supersede: holding, the check exited 11 with no verdict this hook reads"
+  refute_output --partial "Installing fjall"
+}
+
+@test "supersede retry that gets past the check removes the hold annotation an earlier attempt posted" {
+  stub_supersede_module "echo 'supersede: deploying, no newer main build can still deploy or has deployed'"
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "annotation remove --context fjall-deploy-held : true" \
+    "meta-data set fjall-deploy:result success : true" \
+    "meta-data set fjall-deploy:duration * : true"
+  supersede_config
+  export BUILDKITE_RETRY_COUNT="1"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_success
+  assert_output --partial "fjall ci run deploy my-app --non-interactive"
+}
+
+@test "supersede hold still exits 1 when held-by and the annotation fail" {
+  stub_supersede_module "echo 'supersede: held by #528, whose deploy result is failure'; exit 11"
+  stub buildkite-agent \
+    "${SECRET_GET} : echo 'bkua_bats'" \
+    "${MARKED_READ}" \
+    "meta-data set fjall-deploy:held-by 528 : exit 1" \
+    "annotate --style error --context fjall-deploy-held * : exit 1"
+  supersede_config
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  assert_failure
+  assert_equal "$status" 1
+  refute_output --partial "Installing fjall"
 }
 
 @test "supersede beside command: build is refused" {
