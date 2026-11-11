@@ -6,7 +6,7 @@ This is a thin shim onto `fjall ci run` — it installs the CLI and delegates. T
 
 The one exception is `supersede`, which the hook decides itself before it installs the CLI, and never forwards to it (see [Skipping a superseded deploy](#skipping-a-superseded-deploy)).
 
-A tier `target` (`organisation`, `platform`, or `account`) routes to the noun-verb tier command — `fjall org deploy`, `fjall platform destroy`, and so on — and accepts only the flags that tier honours (`force`, `verbose`, and, for `organisation`, `no-cascade`). Any app or deploy-only property paired with a tier target is rejected at the plugin boundary rather than silently dropped.
+A tier `target` (`organisation`, `platform`, or `account`) runs the tier's own command, such as `fjall org deploy` or `fjall platform deploy`, and accepts only the flags that tier honours (`force`, `verbose`, and, for `organisation`, `no-cascade`). From fjall 39.0.12, an `account` or `platform` destroy is refused, because it destroyed every stack in the organisation, and from fjall 40 it removes only that tier's stack. Any app property, or one only a deploy reads, paired with a tier target is refused at the plugin boundary rather than silently dropped.
 
 ## Quick Start
 
@@ -41,16 +41,26 @@ Either way the token is handed only to the `fjall` command: the Node bootstrap a
 
 When `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are both set in the step's
 environment, the CLI uses them and never reaches the Fjall mint; otherwise it
-mints a session from your deploy token. With fjall 39, an application deploy
-on such keys runs in whatever account they belong to, whatever target
-`deploy-target` or `environment` picks, and in `AWS_REGION` (else
-`AWS_DEFAULT_REGION`, else `us-east-2`) unless `region` is set. From fjall 40,
-the CLI first confirms they belong to that target's account and, when they do
-not, refuses the deploy before it records or changes anything, naming both
-accounts and the variables to unset; keys that belong to it deploy in the
-target's own region unless `region` is set. Pick one path: an agent or pipeline
-that exports AWS keys for other steps should not export them to the deploy
-step unless they are the credentials the deploy should use.
+mints a session from your deploy token. With fjall 39, an application deploy or
+destroy on such keys runs in whatever account they belong to, whatever target
+`deploy-target` or `environment` picks. A deploy runs in `AWS_REGION` (else
+`AWS_DEFAULT_REGION`, else `us-east-2`) unless `region` is set, and a destroy
+runs there even when it is. A tier step doesn't check the keys first either. An
+account deploy deploys in their account. It refuses only when that account is
+the one registered with Fjall as the organisation's management or platform
+account, or when Fjall's list of accounts can't be read. An organisation destroy
+records its start and reads AWS Organizations in their account, creating an
+organisation there if it has none, before it checks the account. An organisation
+deploy goes further before that check. It sets up the organisation in their
+account, creating member accounts and organisational units, and registers those
+accounts with Fjall. A platform deploy refuses keys for another account, but
+only after it has recorded its start. From fjall 40, the CLI first confirms they
+belong to the account the step acts on. If they don't, fjall 40 refuses the step
+before it records or changes anything, and names both accounts and the variables
+to unset. If they do, fjall 40 runs an application step in the target's own
+region unless `region` is set. Pick one path. An agent or pipeline that exports
+AWS keys for other steps should not export them to the deploy step unless they
+are the credentials the deploy should use.
 
 #### Option 1: Fjall OIDC (recommended — no AWS setup)
 
@@ -127,7 +137,7 @@ example) fails when they expire.
 | Property            | Required | Default  | Description                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------- | -------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `command`           | no       | `deploy` | `deploy`, `destroy`, or `build`                                                                                                                                                                                                                                                                                                                                |
-| `target`            | **yes**  | —        | Application name, or a tier: `organisation`, `platform`, `account`. App targets run the app; tier targets route to the noun-verb tier command (`fjall org\|platform\|account deploy\|destroy`). `build` is app-only                                                                                                                                            |
+| `target`            | **yes**  | —        | Application name, or one of the tiers `organisation`, `platform` and `account`. App targets run the app, and tier targets run the tier's own command (`fjall org\|platform\|account deploy\|destroy`). From fjall 39.0.12 an `account` or `platform` destroy is refused, and from fjall 40 it removes only that tier's stack. `build` runs on app targets only |
 | `service`           | no       | —        | One service (deploy and build only), from fjall 40 by its whole name, ignoring case. Fjall 39 also selects every service whose name ends with it. A deploy narrows to it only with `mode: deploy-only` or `image-tag`. Fjall 40 refuses it on any other deploy, and fjall 39 leaves it unread                                                                  |
 | `mode`              | no       | `full`   | `full`, `infra-only`, or `deploy-only` (deploy only)                                                                                                                                                                                                                                                                                                           |
 | `environment`       | no       | —        | Target environment                                                                                                                                                                                                                                                                                                                                             |
@@ -205,6 +215,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v30.0.0:
           target: my-app
+          deploy-target: production-use1
 ```
 
 Pair this with the pipeline settings **Skip Intermediate Builds: ON** (queued stale deploys collapse to the newest) and **Cancel Intermediate Builds: OFF** (never interrupt an in-flight CloudFormation update).
@@ -219,6 +230,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v30:
           target: my-app
+          deploy-target: production-use1
           supersede:
             after: verify-ci-green
             token-secret: CI_GREEN_API_TOKEN
@@ -292,6 +304,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v30.0.0:
           target: my-app
+          deploy-target: production-use1
           mode: infra-only
 ```
 
@@ -305,6 +318,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v30.0.0:
           target: my-app
+          deploy-target: production-use1
           image-tag: "app-sha-4f9c2ab0d1e3"
 ```
 
@@ -317,6 +331,7 @@ steps:
       - fjall-tech/fjall-deploy#v30.0.0:
           command: destroy
           target: my-app
+          deploy-target: production-use1
           force: true
 ```
 
@@ -330,6 +345,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v30.0.0:
           target: my-app
+          deploy-target: production-use1
           service: api
           image-tag: "api-sha-4f9c2ab0d1e3"
 ```
@@ -357,6 +373,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v30.0.0:
           target: my-app
+          deploy-target: production-use1
           image-tag: "sha-4f9c2ab"
 ```
 
@@ -370,6 +387,7 @@ steps:
     plugins:
       - fjall-tech/fjall-deploy#v30.0.0:
           target: my-app
+          deploy-target: production-use1
           cli-version: "39.0.0"
 ```
 
