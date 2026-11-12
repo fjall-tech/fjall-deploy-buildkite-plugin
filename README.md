@@ -4,7 +4,7 @@ A [Buildkite plugin](https://buildkite.com/docs/plugins) to deploy, destroy, or 
 
 This is a thin shim onto `fjall ci run` — it installs the CLI and delegates. The CLI owns command and flag validation, so an invalid combination (for example `mode` with `command: destroy`) fails with a directional error from `fjall` rather than being silently dropped.
 
-The one exception is `supersede`, which the hook decides itself before it installs the CLI, and never forwards to it (see [Skipping a superseded deploy](#skipping-a-superseded-deploy)).
+Two properties are the hook's own and never reach the CLI. The hook decides `supersede` before it installs the CLI (see [Skipping a superseded deploy](#skipping-a-superseded-deploy)), and reads `build-record` after the CLI ends (see [Build summary](#build-summary)).
 
 A tier `target` (`organisation`, `platform`, or `account`) runs the tier's own command, such as `fjall org deploy` or `fjall platform deploy`, and accepts only the flags that tier honours (`force`, `verbose`, and, for `organisation`, `no-cascade`). From fjall 39.0.12, an `account` or `platform` destroy is refused, because it destroyed every stack in the organisation, and from fjall 40 it removes only that tier's stack. Any app property, or one only a deploy reads, paired with a tier target is refused at the plugin boundary rather than silently dropped.
 
@@ -156,9 +156,10 @@ example) fails when they expire.
 | `cli-version`       | no       | `39`     | Pin the `fjall` CLI version. Defaults to this plugin's compatible major (floats across `39`.x, never crossing into the next major); `auto` derives the major from the app's pinned `@fjall/components-infrastructure`; `latest` always installs the newest published release                                                                                   |
 | `working-directory` | no       | `.`      | Folder that holds the project's `fjall/` folder, relative to the repository's checkout. `fjall` runs there                                                                                                                                                                                                                                                     |
 | `force`             | no       | `false`  | Deploy: deploy every stack, including those with no detected changes (CloudFormation leaves an unchanged stack as it is). Destroy: bypass the busy-stack guard and destroy while the target's stacks are mid-operation. App destroys skip destruction confirmation in CI regardless; a tier destroy still needs force to pass its non-interactive confirmation |
+| `build-record`      | no       | `true`   | Keep the builder's record of this run's images as a build artifact. It holds build arg values and each step's unmasked log, which anyone who can read the build can download. Needs buildx 0.23.0 or later. A destroy and a tier target keep no record, since they build no image. See [Keeping the build record](#keeping-the-build-record)                   |
 | `supersede`         | no       | —        | Skip this deploy when a newer `main` build of the same pipeline already carries its commit. An object of `after`, `token-secret` and an optional `barriers` list, valid only with `command: deploy` and an application target. See [Skipping a superseded deploy](#skipping-a-superseded-deploy)                                                               |
 
-Boolean properties take `true` or `false`; leave one out for its default, `false`. Any other value stops the step before anything is fetched or installed, with an error naming the property: a quoted spelling (`"yes"`, `'True'`, `"0"`), an unquoted number (`1`, `0`), a padded value, or an interpolation that resolves to anything else. An unquoted word reaches the plugin as the YAML parser that read the pipeline makes it. The YAML 1.2 parser that agent v3.138.0's pipeline upload uses turns unquoted `True` and `TRUE` into `true`, and keeps unquoted `yes`, `no`, `on` and `off` as strings, which stop the step. An older agent whose parser reads YAML 1.1 turns those four into booleans, which are accepted. Unquoted `true` and `false` work whatever parses the pipeline, Buildkite itself included for a step defined in its UI.
+Boolean properties take `true` or `false`. Leave one out for its default, which is `false` for every one but `build-record`. Any other value stops the step before anything is fetched or installed, with an error naming the property: a quoted spelling (`"yes"`, `'True'`, `"0"`), an unquoted number (`1`, `0`), a padded value, or an interpolation that resolves to anything else. An unquoted word reaches the plugin as the YAML parser that read the pipeline makes it. The YAML 1.2 parser that agent v3.138.0's pipeline upload uses turns unquoted `True` and `TRUE` into `true`, and keeps unquoted `yes`, `no`, `on` and `off` as strings, which stop the step. An older agent whose parser reads YAML 1.1 turns those four into booleans, which are accepted. Unquoted `true` and `false` work whatever parses the pipeline, Buildkite itself included for a step defined in its UI.
 
 A property given an empty value stops the step the same way, whatever its type. The plugin cannot tell an interpolation whose variable is unset (`image-tag: "${ROLLBACK_TAG}"`) from a value left blank on purpose, and reading it as the property left out would turn that rollback into a build and deploy. Leave the property out, give it a value, or, for a property without a default, give it `-`, which means none: `service`, `environment`, `deploy-target`, `region`, `image-tag`, `approval-token` and `supersede` read `-` as left out, and `build-args` and `build-secrets` read a single `-` as no list. Every other property refuses `-`, `cli-version` and `working-directory` included. Pass `approval-token` the plan's token as it is, never with a `-` fallback: a plan cancelled before it finished leaves no token to interpolate, and the empty value stops the apply step. Handed `-`, the step runs with no token and could deploy with no reviewed plan, unless it sets `require-approval: true` without `auto-approve: true`. An interpolation supplies `-` when the variable is unset or empty:
 
@@ -194,6 +195,52 @@ The plugin records these as [build metadata](https://buildkite.com/docs/pipeline
 A `superseded` build records no duration. It posts a warning annotation that names the newer build. A held build records no duration either, and posts an error annotation ([Holding after a failed deploy](#holding-after-a-failed-deploy)).
 
 A `plan-pending` result also posts a warning annotation (re-run instructions when the run printed an approval token, otherwise a note that the run stopped before it completed), and the step exits `2` so downstream steps can gate on it.
+
+A run that builds images also posts their [build summary](#build-summary) as an info annotation, whatever its result, and uploads the builder's record of them as an artifact unless `build-record` is `false`.
+
+## Build summary
+
+After the CLI ends, whether the run passed, failed or stopped with a plan pending, the plugin posts an info annotation with one table, a row for each image the run built. It reads the `fjall` builder's own history (`docker buildx history`), never the CLI's output, so it works with any `cli-version`. It never changes the step's exit status. Its reads stop after 30 seconds, so it adds little more than that to the step. It needs Docker with buildx 0.21.0 or later on the agent. A destroy posts no summary, and neither does a tier deploy or any other run that built no image.
+
+Each row is one image. Its first cell reads `image 1`, `image 2` and so on in the order the images were built, with the platform the image was built for in brackets, such as `image 1 (linux/arm64)`. No name the pipeline or a Dockerfile chose appears in the summary, because the plugin has no way to mask one. Match a row to a service by the build order in the CLI's log.
+
+The other columns are these.
+
+- **Built**, `native` when the image's platform is the agent's own, `emulated on <platform>` when the agent built it under QEMU on a host of the platform named, and `unknown` when the plugin couldn't tell.
+- **Total**, the whole build as the builder timed it. It ends `, failed` for a build that failed and `, cancelled` for one that stopped before it finished, and reads `running` for one still running when the summary read it.
+- **Context**, sending the build context to the builder, with its size.
+- **Cache lookup**, reading the image's cache from its registry, with what the read found, which is `found`, `none found`, `refused`, `failed` or `not finished`.
+- **Cache pull**, the steps the cache served, which includes pulling and unpacking their layers. It also counts time those steps spent waiting, so it is an upper bound.
+- **Rebuilt steps**, the steps the cache missed, and any that failed.
+- **Cached**, the share of steps the cache served. A `FROM` step, which pulls the base image, is never counted. The cell also counts any step that failed, and any that never finished, such as one BuildKit stopped when another stage failed.
+- **Image push**, pushing the image to its registry.
+- **Cache export**, writing the cache back to the registry, with the number of layers written.
+
+Each column is a window on the builder's clock. BuildKit runs phases at the same time where it can, so the windows overlap and don't add up to Total.
+
+Below the table, each image lists its 3 slowest rebuilt steps and the first step the cache missed, which rebuilt every step after it in its stage. A step is named by its number and instruction alone, such as `[4/9] COPY`, because BuildKit names a `RUN` step with its build args already filled in. The notes say which images were built under emulation and which agent architecture builds them natively, how each cache lookup went, and how many builds were left out. They also give each image's `docker buildx history logs --builder fjall <ref>` command, which prints its full build log. The builder's history lives on the Docker host of the agent that ran the deploy, so the command works only there, as from a hook of the same job, and a step on another agent finds nothing. The [build record](#keeping-the-build-record) is a copy that travels with the build.
+
+The annotation's context is `fjall-build-summary-<job id>`, so each job of a step with `parallelism` or a `matrix` posts its own summary. A retry is a new job, so its summary appears beside the earlier attempt's.
+
+### Keeping the build record
+
+By default the plugin keeps the builder's record of the run's images as a build artifact named `fjall-build-record-<8 hex digits>.dockerbuild`. It holds each step's full name, timing and log, which the summary leaves out. Docker Desktop 4.31 or later opens it in its Builds view, through Import builds or `docker buildx history import --file <file>`. It needs buildx 0.23.0 or later, and is written in whatever is left of the 30 seconds once the table's reads are done.
+
+Everything the record holds is unmasked. It holds every build arg's value, both as the build's own argument and inside the name of each `RUN` step that uses it. It holds each Dockerfile's whole source, every instruction as written and as run, with the environment each `RUN` step saw, the image's configuration and each step's log. It also names the absolute paths of the build context and the Dockerfile on the agent. Anyone who can read the build can download its artifacts, which on a public pipeline is anyone, so a reader of the build who can't read the repository gets its Dockerfiles this way. Pass a secret through `build-secrets`, never `build-args`, whether or not you keep the record.
+
+Where a reader of the build shouldn't see what the builds used, set `build-record: false` to keep no record. A destroy and a tier target keep none whatever the property says, since they build no image.
+
+```yaml
+steps:
+  - label: ":rocket: Deploy"
+    plugins:
+      - fjall-tech/fjall-deploy#v30:
+          target: my-app
+          deploy-target: production-use1
+          build-record: false
+```
+
+The summary and the record need a plugin release that ships them, so the example above uses the moving major tag. An exact pin of an earlier release posts no summary and keeps no record. So does an agent that cloned the plugin before they shipped, until it next clones the plugin fresh.
 
 ## Verifying a Deploy
 
@@ -510,11 +557,29 @@ Two different credentials can fail — the error tells you which:
 
 A deploy that builds a container image needs Docker, running, with the buildx plugin, and so does every `build`. With CLI 40 or later, a deploy checks for them once it knows it will build an image, before it changes a stack, and a deploy that builds none (a static site's, an OpenNext app's, an `image-tag` deploy, or a `mode: infra-only` deploy that does not deploy its Compute stack, because that stack did not change and `force` is not set) never checks. An image that CDK builds as an asset, whether the app's own CDK code declares it or hands it to a Fjall construct (a scheduled task's `image` given as `ContainerImage.fromAsset(...)`), is built by CDK when its stack deploys, and the check does not cover it. On the 39.x CLI, every application deploy checks for buildx before it starts, whatever the app builds, unless it sets `mode: infra-only` or `skip-build`. That check passes while Docker is stopped, and `skip-build` skips only a static-site or OpenNext build command, so on an agent that cannot build, a container app's full deploy that gets past the check fails at the image build, after the stacks before Compute have deployed. Install Docker with the buildx plugin on self-hosted agents that build images.
 
+### No build summary, or only part of one
+
+When the [build summary](#build-summary) can't show everything, the step log says why in one line. The causes and their cures are these.
+
+- **Docker isn't on the agent's `PATH`.** No summary is posted. An agent that builds images needs Docker with buildx anyway ([`docker: command not found`](#docker-command-not-found)).
+- **buildx is older than 0.21.0.** There's no table, because the plugin can't read that buildx's build history. Upgrade buildx on the agent to 0.21.0 or later.
+- **buildx is older than 0.23.0 and `build-record` is on, as it is by default.** The table appears, but there's no record. Upgrade buildx on the agent to 0.23.0 or later.
+- **No image build was found.** The run built no image, as a static site, an `image-tag` roll and an `infra-only` deploy that doesn't deploy its Compute stack don't. If the run did build one, the clock of the agent's Docker host may run more than 5 seconds behind the agent's own, so its builds look older than the run. Correct that clock.
+- **Some builds were left out.** The summary keeps a build only when its context lies inside the step's checkout, so another job's build on a shared builder is counted and left out. If a build of this run was left out, check that its service's Docker context lies inside the repository.
+- **More than 20 images were built.** The table shows the first 20 in build order and counts the rest.
+- **The 30 seconds ran out.** The table shows the images read in time and counts the rest, and the record, which is written last, may be missing. Read the rest with `docker buildx history ls --builder fjall` on the agent's Docker host.
+- **Total reads `running` or ends `, cancelled`.** The build hadn't finished when the summary read it, or it stopped before it finished, as when the run was cancelled or another image's build failed. The step log above the summary says why the run stopped.
+- **An image was built under emulation.** Its `RUN` steps ran under QEMU, which is much slower than a native build. Run the step on an agent of the image's architecture ([Agent Architecture](#agent-architecture)).
+- **Cache lookup reads `none found`.** The registry held no cache for the image, as on a first build or after the cache expired. This build writes one, and the next build reads it. `refused` means the registry denied the read, and `failed` means the read failed another way. For either, run the image's `docker buildx history logs` command from the notes on the agent's Docker host, or read the step logs in the build record, to see the registry's answer. `not finished` means the build stopped before the lookup ended.
+- **The summary isn't annotated, since the job has no `BUILDKITE_JOB_ID`.** That variable names the annotation, and Buildkite sets it for each job, so check that nothing in the step's `env` or a hook clears it.
+- **The build summary module exited with a status other than 0, or the build record isn't uploaded because of its name.** Either one is a fault in the plugin. Report it to Fjall with the step's log. Whatever summary the module wrote is still posted.
+
 ## Requirements
 
 - Node.js >= 22.12.0 — if the agent's node is below that floor (or absent), the plugin bootstraps a pinned Node build from nodejs.org, SHA-256-verified before use (a Linux x64 or arm64 agent with `curl` and `tar` is required for the bootstrap path; a download that stalls is cut and retried, and fails rather than holding the step)
 - npm
 - Docker with buildx — every `build`, and every application deploy that builds a container image; on the 39.x CLI, every application deploy without `mode: infra-only` or `skip-build` checks for buildx before it starts, whatever the app builds (see [`docker: command not found`](#docker-command-not-found))
+- buildx 0.21.0 or later for the [build summary](#build-summary), and 0.23.0 or later for `build-record`. With an older buildx the deploy runs as before, and the step log says what the summary left out
 - A Fjall deploy token (`FJALL_API_KEY`), which is also the deploy's AWS credential unless the step's environment carries AWS keys — see [Authentication](#authentication)
 
 ## Running Tests

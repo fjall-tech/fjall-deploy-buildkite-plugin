@@ -323,7 +323,8 @@ setup() {
 teardown() {
   # Tolerant unstubs: early-exit tests (missing target, leading-dash rejection)
   # leave node/npm/fjall plans unconsumed, and the Node-bootstrap tests stub
-  # uname/curl/sha256sum/tar that other tests never touch.
+  # uname/curl/sha256sum/tar that other tests never touch. The build summary
+  # tests stub docker.
   unstub node || true
   unstub npm || true
   unstub fjall || true
@@ -332,6 +333,7 @@ teardown() {
   unstub curl || true
   unstub sha256sum || true
   unstub tar || true
+  unstub docker || true
 }
 
 @test "Deploys with minimal config via ci run" {
@@ -463,17 +465,18 @@ teardown() {
 }
 
 # The properties are plugin.yml's, less the ones a tier target takes: the two
-# positionals, the flags a tier leaf honours, and the two the hook consumes
-# itself. A property added to the manifest is therefore refused beside a tier
-# target, or named here as one a tier honours. The refusal comes before the
-# install, so no run consumes a plan.
+# positionals, the flags a tier leaf honours, the two the hook consumes
+# itself, and build-record, which is on by default and keeps nothing where no
+# image is built. A property added to the manifest is therefore refused beside
+# a tier target, or named here as one a tier honours. The refusal comes before
+# the install, so no run consumes a plan.
 @test "every application-only property is refused with a tier target, not dropped" {
   local type properties property env_name value
   for type in string boolean array; do
     properties="$(properties_of_type "${type}")"
     for property in ${properties}; do
       case "${property}" in
-        command | target | force | verbose | no-cascade | cli-version | working-directory) continue ;;
+        command | target | force | verbose | no-cascade | cli-version | working-directory | build-record) continue ;;
       esac
       env_name="$(property_env "${property}")"
       case "${type}" in
@@ -1520,8 +1523,9 @@ PATH"
   done
 }
 
-# The other half: `false` reads as false, as a property left out does, so
-# every boolean property set to it deploys with none of the flags. A plan
+# The other half: `false` reads as false, as a property left out does for
+# every one but build-record, which never reaches the CLI. So every boolean
+# property set to it deploys with none of the flags. A plan
 # answers one run, so each run puts them back first.
 @test "every boolean property reads false as false" {
   local properties property env_name
@@ -2632,4 +2636,431 @@ STEP_CLAIM_SET="meta-data set fjall-deploy:supersede-step ${STEP_CLAIM} : true"
   assert_failure
   assert_output --partial "'supersede' sets BUILDKITE_PLUGIN_FJALL_DEPLOY_SUPERSEDE_BARRIER_0"
   refute_output --partial "Installing fjall"
+}
+
+# The build summary runs once the CLI has ended and its result is recorded.
+# These tests stub docker, which the hook only looks for, and give node a
+# second plan line that stands in for build-summary.mjs. The module's double
+# reads its argv by position, as the hook builds it.
+SUMMARY_JOB_ID="0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a90"
+SUMMARY_CONTEXT="fjall-build-summary-${SUMMARY_JOB_ID}"
+SUMMARY_RECORD_NAME="fjall-build-record-0123abcd.dockerbuild"
+SUMMARY_RECORD_ARGS=" --record-dir *"
+
+# One job, whatever the environment the suite runs in carries.
+summary_job() {
+  export BUILDKITE_JOB_ID="${SUMMARY_JOB_ID}"
+}
+
+# One run of the hook whose CLI exits $1. npm's and fjall's plans are put
+# back first, since a plan answers one run.
+stub_cli_exiting() {
+  unstub --allow-missing npm || true
+  unstub --allow-missing fjall || true
+  stub npm "install -g --ignore-scripts fjall@${FJALL_CLI_DEFAULT_MAJOR} : echo 'installed fjall@${FJALL_CLI_DEFAULT_MAJOR}'"
+  stub fjall \
+    "--version : echo 'fjall/0.88.3'" \
+    "ci run deploy my-app --non-interactive : echo 'cli exits $1'; exit $1"
+}
+
+# node as one run of the hook calls it, with the version check first and
+# then build-summary.mjs, given the argv the hook builds and $2 after it,
+# which runs $1. $2 is the record directory the hook hands the module by
+# default, and a test of a run that keeps no record passes it empty.
+# `bats-mock` matches each word exactly, and a lone * matches any one, so the
+# job's own directory is the only checkout this plan admits, and a
+# --record-dir the test does not expect is an argument too many.
+stub_summary_module() {
+  unstub --allow-missing node || true
+  stub node \
+    "--version : echo 'v${HOOK_NODE_VERSION}'" \
+    "$PWD/build-summary.mjs --ci buildkite --since * --checkout $PWD --summary-out * --outputs *${2-${SUMMARY_RECORD_ARGS}} : $1"
+}
+
+# The agent calls the hook makes to record the result of a CLI exit of $1,
+# then each plan line given after it, for the build summary's own calls.
+stub_agent_after_cli() {
+  local code="$1" result
+  shift
+  case "${code}" in
+    0) result="success" ;;
+    2) result="plan-pending" ;;
+    *) result="failure" ;;
+  esac
+  local plan=("meta-data set fjall-deploy:result ${result} : true" "meta-data set fjall-deploy:duration * : true")
+  if [ "${code}" = 2 ]; then
+    plan+=("annotate --style warning * : true")
+  fi
+  stub buildkite-agent "${plan[@]}" "$@"
+}
+
+# The module's double. It names each credential it was handed, says when its
+# run began, keeps the path of the summary file it was given in
+# `summary-file`, and appends $1 to that file.
+summary_module_writing() {
+  printf '%s' "$(credential_report module); echo \"module since \$5\"; printf '%s\n' \"\$9\" > '${BATS_TEST_TMPDIR}/summary-file'; printf '%s\n' '$1' >> \"\$9\""
+}
+
+# The module's double for a run with `build-record`. It writes the summary as
+# above, keeps the record directory it was given in `record-dir`, and names
+# $1 as the record it wrote. It writes a file of that name unless $2 is
+# unwritten, so a name of the wrong shape is refused by its shape alone.
+summary_module_recording() {
+  local write="touch \"\${13}/$1\"; "
+  if [ "${2-}" = "unwritten" ]; then
+    write=""
+  fi
+  printf '%s' "$(summary_module_writing SUMMARY_TABLE); printf '%s\n' \"\${13}\" > '${BATS_TEST_TMPDIR}/record-dir'; ${write}printf 'record-path=%s\nrecord-name=%s\n' \"\${13}/$1\" '$1' >> \"\${11}\""
+}
+
+# The annotation's double, which prints the body it read on stdin.
+SUMMARY_ANNOTATION="annotate --style info --context ${SUMMARY_CONTEXT} : echo \"annotation body: \$(cat)\""
+
+# The summary file the module's double was given is gone, and so is the
+# directory the hook made for it, the record directory included.
+assert_summary_files_removed() {
+  local summary_file
+  summary_file="$(cat "$BATS_TEST_TMPDIR/summary-file")"
+  run test -n "${summary_file}"
+  assert_success
+  run test -e "${summary_file}"
+  assert_failure
+  run test -e "${summary_file%/*}"
+  assert_failure
+}
+
+# Every test before this section runs the hook on an agent with no docker,
+# where the build summary prints one line and calls neither node nor the
+# agent, so their exact plans hold. That rests on the tester image having no
+# docker of its own.
+@test "build summary tests run on a tester image with no docker" {
+  run command -v docker
+  assert_failure
+}
+
+@test "build summary is one line and no call on an agent without docker, whatever the CLI's exit status" {
+  local code
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  for code in 0 1 2; do
+    stub_cli_exiting "${code}"
+    unstub --allow-missing node || true
+    stub node "--version : echo 'v${HOOK_NODE_VERSION}'"
+    stub_agent_after_cli "${code}"
+
+    run "$PWD/hooks/command"
+
+    unstub buildkite-agent
+    unstub node
+    assert_equal "${status}" "${code}"
+    assert_equal "${lines[-2]}" "cli exits ${code}"
+    assert_equal "${lines[-1]}" "No build summary, since docker is not on this agent's PATH."
+  done
+}
+
+@test "build summary runs the module without the job token or AWS keys, and annotates its step with the table" {
+  stub docker
+  stub_summary_module "$(summary_module_writing SUMMARY_TABLE)"
+  stub_agent_after_cli 0 "${SUMMARY_ANNOTATION}"
+  summary_job
+  export BUILDKITE_AGENT_ACCESS_TOKEN="job-token"
+  export AWS_ACCESS_KEY_ID="AKIAHOOKTEST"
+  export AWS_SECRET_ACCESS_KEY="secret-key"
+  export AWS_SESSION_TOKEN="session-token"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  unstub docker
+  assert_success
+  assert_line "cli received: ci run deploy my-app --non-interactive"
+  assert_line --regexp '^module since [0-9]+$'
+  refute_output --partial "module holds"
+  assert_line "annotation body: SUMMARY_TABLE"
+  assert_summary_files_removed
+}
+
+@test "build summary leaves the CLI's exit status alone when the module and the annotation fail" {
+  local code
+  stub docker
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  for code in 0 1 2; do
+    stub_cli_exiting "${code}"
+    stub_summary_module "$(summary_module_writing SUMMARY_TABLE); exit 1"
+    stub_agent_after_cli "${code}" "annotate --style info --context ${SUMMARY_CONTEXT} : echo 'annotation refused'; exit 1"
+
+    run "$PWD/hooks/command"
+
+    unstub buildkite-agent
+    unstub node
+    assert_equal "${status}" "${code}"
+    assert_line "cli exits ${code}"
+    assert_line "The build summary module exited 1, so the summary may be incomplete."
+    assert_line "annotation refused"
+    assert_summary_files_removed
+  done
+}
+
+@test "build summary makes no annotation for a job with no job id, and leaves the exit status alone" {
+  local code
+  stub docker
+  export BUILDKITE_JOB_ID=""
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  for code in 0 1 2; do
+    stub_cli_exiting "${code}"
+    stub_summary_module "$(summary_module_writing SUMMARY_TABLE)"
+    stub_agent_after_cli "${code}"
+
+    run "$PWD/hooks/command"
+
+    unstub buildkite-agent
+    unstub node
+    assert_equal "${status}" "${code}"
+    assert_line "The build summary is not annotated, since the job has no BUILDKITE_JOB_ID to name its annotation by."
+    assert_summary_files_removed
+  done
+}
+
+# The jobs of a step with parallelism or a matrix share its step id, and each
+# builds its own images, so each job's summary is an annotation of its own.
+@test "build summary names its annotation by the job, not the step it shares" {
+  stub docker
+  stub_summary_module "$(summary_module_writing SUMMARY_TABLE)"
+  stub_agent_after_cli 0 "annotate --style info --context fjall-build-summary-0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a91 : echo \"annotation body: \$(cat)\""
+  export BUILDKITE_STEP_ID="${SUMMARY_JOB_ID}"
+  export BUILDKITE_JOB_ID="0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a91"
+  export BUILDKITE_PARALLEL_JOB="3"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  assert_line "annotation body: SUMMARY_TABLE"
+}
+
+# A tier deploy, or a run that built nothing, leaves the summary file empty.
+@test "build summary makes no annotation when the module writes no table" {
+  stub docker
+  stub_summary_module "echo 'No image build found for this run.'"
+  stub_agent_after_cli 0
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  assert_line "No image build found for this run."
+}
+
+# The module keeps a build only when its context lies inside the checkout,
+# so it is pointed at the job's own directory, never the one
+# `working-directory` moves the CLI into. The plan admits no other checkout.
+@test "build summary reads the builder from the checkout when the CLI runs in another directory" {
+  stub docker
+  stub_summary_module "echo \"module ran for checkout \$7\""
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_WORKING_DIRECTORY="tests"
+
+  run "$PWD/hooks/command"
+
+  unstub node
+  assert_success
+  assert_line "module ran for checkout $PWD"
+  assert_line "The build summary is not annotated, since buildkite-agent is not on this agent's PATH."
+}
+
+@test "build summary with a build record uploads the record the module names, from the directory it was written to" {
+  stub docker
+  stub_summary_module "$(summary_module_recording "${SUMMARY_RECORD_NAME}")" "${SUMMARY_RECORD_ARGS}"
+  stub_agent_after_cli 0 \
+    "${SUMMARY_ANNOTATION}" \
+    "artifact upload ${SUMMARY_RECORD_NAME} : echo \"uploaded from \$PWD\"; test -f '${SUMMARY_RECORD_NAME}' && echo 'the record is there'"
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD="true"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  assert_line "annotation body: SUMMARY_TABLE"
+  assert_line "Uploading the build record ${SUMMARY_RECORD_NAME} as an artifact. It holds build arg values, each Dockerfile's source and each step's log, unmasked, and anyone who can read this build can download it."
+  assert_line "uploaded from $(cat "$BATS_TEST_TMPDIR/record-dir")"
+  assert_line "the record is there"
+  assert_summary_files_removed
+}
+
+@test "build summary keeps the record by default, uploading the record the module names when build-record is left out" {
+  stub docker
+  stub_summary_module "$(summary_module_recording "${SUMMARY_RECORD_NAME}")"
+  stub_agent_after_cli 0 \
+    "${SUMMARY_ANNOTATION}" \
+    "artifact upload ${SUMMARY_RECORD_NAME} : echo \"uploaded from \$PWD\"; test -f '${SUMMARY_RECORD_NAME}' && echo 'the record is there'"
+  summary_job
+  unset BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  assert_line "Uploading the build record ${SUMMARY_RECORD_NAME} as an artifact. It holds build arg values, each Dockerfile's source and each step's log, unmasked, and anyone who can read this build can download it."
+  assert_line "uploaded from $(cat "$BATS_TEST_TMPDIR/record-dir")"
+  assert_line "the record is there"
+  assert_summary_files_removed
+}
+
+@test "build summary with build-record false hands the module no record directory and uploads none" {
+  stub docker
+  stub_summary_module "$(summary_module_writing SUMMARY_TABLE)" ""
+  stub_agent_after_cli 0 "${SUMMARY_ANNOTATION}"
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD="false"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  assert_line "annotation body: SUMMARY_TABLE"
+  refute_output --partial "build record"
+  assert_summary_files_removed
+}
+
+# A tier deploy builds no image, so it keeps no record whatever build-record
+# says. The property is on by default, so it is never refused there. The
+# module's plan admits no --record-dir, and the agent's admits no upload.
+@test "a tier deploy keeps no record and uploads none, whether build-record is left out or true" {
+  local target noun setting
+  stub docker
+  summary_job
+  for target in organisation platform account; do
+    case "${target}" in
+      organisation) noun="org" ;;
+      *) noun="${target}" ;;
+    esac
+    for setting in default true; do
+      restub_agent_tools
+      stub_summary_module "echo 'No image build found for this run.'" ""
+      stub_agent_after_cli 0
+      export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="${target}"
+      if [ "${setting}" = "true" ]; then
+        export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD="true"
+      else
+        unset BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD
+      fi
+
+      run "$PWD/hooks/command"
+
+      unstub buildkite-agent
+      unstub node
+      assert_success
+      assert_line "cli received: ${noun} deploy --non-interactive"
+      assert_line "No image build found for this run."
+      refute_output --partial "build record"
+      refute_output --partial "not valid with tier target"
+    done
+  done
+}
+
+# A destroy builds no image, so it keeps no record whatever build-record says,
+# on an app target or a tier one. It reaches neither the module nor an upload.
+@test "a destroy keeps no record and uploads none, whether build-record is left out or true" {
+  local target argv setting
+  stub docker
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND="destroy"
+  for target in my-app organisation; do
+    case "${target}" in
+      organisation) argv="org destroy --non-interactive" ;;
+      *) argv="ci run destroy ${target} --non-interactive" ;;
+    esac
+    for setting in default true; do
+      restub_agent_tools
+      stub_agent_after_cli 0
+      export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="${target}"
+      if [ "${setting}" = "true" ]; then
+        export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD="true"
+      else
+        unset BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD
+      fi
+
+      run "$PWD/hooks/command"
+
+      unstub buildkite-agent
+      assert_success
+      assert_line "cli received: ${argv}"
+      assert_equal "${lines[-1]}" "No build summary, since a destroy builds no image."
+      refute_output --partial "build record"
+      refute_output --partial "build-record"
+    done
+  done
+}
+
+# The name comes from the module, so the hook uploads only the one shape the
+# module writes, which can neither leave the record directory nor pick
+# another file. Each name below is written, so only its shape refuses it.
+@test "build summary uploads no record whose name is not the one shape the module writes" {
+  local name
+  stub docker
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD="true"
+  for name in fjall-build-record-0123ABCD.dockerbuild fjall-build-record-0123abcd.dockerbuild.sh ../fjall-build-record-0123abcd.dockerbuild; do
+    stub_cli_exiting 0
+    stub_summary_module "$(summary_module_recording "${name}")" "${SUMMARY_RECORD_ARGS}"
+    stub_agent_after_cli 0 "${SUMMARY_ANNOTATION}"
+
+    run "$PWD/hooks/command"
+
+    unstub buildkite-agent
+    unstub node
+    assert_success
+    assert_line "The build record is not uploaded, since its name is not one build-summary.mjs writes. The value given is not repeated here."
+    refute_output --partial "${name}"
+    refute_output --partial "Uploading the build record"
+    assert_summary_files_removed
+  done
+}
+
+@test "build summary uploads no record the module names but did not write" {
+  stub docker
+  stub_summary_module "$(summary_module_recording "${SUMMARY_RECORD_NAME}" unwritten)" "${SUMMARY_RECORD_ARGS}"
+  stub_agent_after_cli 0 "${SUMMARY_ANNOTATION}"
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD="true"
+
+  run "$PWD/hooks/command"
+
+  unstub buildkite-agent
+  unstub node
+  assert_success
+  assert_line "The build record is not uploaded, since build-summary.mjs named a record it did not write."
+  refute_output --partial "Uploading the build record"
+}
+
+@test "build summary is skipped for a destroy, which builds no image" {
+  stub docker
+  summary_job
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_COMMAND="destroy"
+  export BUILDKITE_PLUGIN_FJALL_DEPLOY_TARGET="my-app"
+
+  run "$PWD/hooks/command"
+
+  unstub node
+  unstub docker
+  assert_success
+  assert_line "cli received: ci run destroy my-app --non-interactive"
+  assert_equal "${lines[-1]}" "No build summary, since a destroy builds no image."
 }

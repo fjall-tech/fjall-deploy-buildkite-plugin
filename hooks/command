@@ -79,6 +79,7 @@ approval_token="${BUILDKITE_PLUGIN_FJALL_DEPLOY_APPROVAL_TOKEN:-}"
 cli_version="${BUILDKITE_PLUGIN_FJALL_DEPLOY_CLI_VERSION:-${fjall_cli_default_major}}"
 working_dir="${BUILDKITE_PLUGIN_FJALL_DEPLOY_WORKING_DIRECTORY:-.}"
 force="${BUILDKITE_PLUGIN_FJALL_DEPLOY_FORCE-false}"
+build_record="${BUILDKITE_PLUGIN_FJALL_DEPLOY_BUILD_RECORD-true}"
 
 # Every property is checked here, before anything is fetched, installed or
 # run. A refusal names the property and the rule, never the value: nothing has
@@ -115,6 +116,7 @@ require_boolean plan "${plan}"
 require_boolean require-approval "${require_approval}"
 require_boolean auto-approve "${auto_approve}"
 require_boolean force "${force}"
+require_boolean build-record "${build_record}"
 
 # A string property the pipeline wrote but left empty is refused too, and
 # for the same cause: the agent sets no variable for a property left out,
@@ -321,6 +323,16 @@ case "${target}" in
   account) tier_noun="account" ;;
   *) tier_noun="" ;;
 esac
+
+# A run keeps the build record only when it builds images. A destroy and a
+# tier target build none, so they keep none whatever `build-record` says,
+# rather than refuse it. It is on by default, and the GitHub Action is handed
+# a value the workflow set and its default alike. Keep in lockstep with the
+# GitHub Action's action.yml.
+keep_record="false"
+if [ "${build_record}" = "true" ] && [ "${cmd}" != "destroy" ] && [ -z "${tier_noun}" ]; then
+  keep_record="true"
+fi
 
 if [ -n "${tier_noun}" ]; then
   # Tier path. The tier leaves honour only --force, --verbose and
@@ -535,9 +547,9 @@ if [ "${node_agent_version}" != "${node_floor}" ] && [ "${node_lowest}" = "${nod
   echo "Bootstrapped Node ${node_version}"
 fi
 
-# npm, the engine resolver, the version check and the supersede check run
-# without the job token, which could fetch the deploy token again, and
-# without the AWS keys a step's environment may carry.
+# npm, the engine resolver, the version check, the supersede check and the
+# build summary run without the job token, which could fetch the deploy token
+# again, and without the AWS keys a step's environment may carry.
 install_step() {
   (
     unset BUILDKITE_AGENT_ACCESS_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
@@ -774,6 +786,10 @@ echo "Installed $(install_step fjall --version)"
 
 # Run with timing; tee output so the approval token can be captured
 echo "--- :rocket: fjall ${args[*]}"
+# The build summary keeps a build only when its context lies inside the
+# checkout, so it reads the builder from the job's own directory, which
+# `working-directory` moves the CLI away from.
+checkout_root="$(pwd)"
 cd -- "${working_dir}"
 
 # The one process the deploy token is handed to. Without one, the CLI falls
@@ -785,6 +801,90 @@ run_cli() {
     fjall "$@"
   fi
 }
+
+# Once the run has ended and its result is recorded, build-summary.mjs reads
+# the images it built from the `fjall` builder's history, never from the CLI,
+# and writes one table, a row per image, which goes up as an info annotation.
+# When the run keeps the build record, it also writes the builder's record of
+# those images, which goes up as an artifact. Nothing here changes the step's
+# exit status. The body is a subshell, because under `set -u` an unbound
+# variable ends the shell even inside an `|| true` list, and here it ends only
+# the subshell. Every agent call ends `|| true`, and the subshell's own trap
+# removes its temporary directory however it ends. The module runs through
+# install_step, so it holds neither token nor the step's AWS keys.
+report_build_summary() (
+  if [ "${cmd}" = "destroy" ]; then
+    echo "No build summary, since a destroy builds no image."
+    return 0
+  fi
+  if ! command -v docker > /dev/null 2>&1; then
+    echo "No build summary, since docker is not on this agent's PATH."
+    return 0
+  fi
+  if ! summary_dir="$(mktemp -d)" || [ -z "${summary_dir}" ]; then
+    echo "No build summary, since its temporary directory could not be made."
+    return 0
+  fi
+  trap 'rm -rf -- "${summary_dir}"' EXIT
+  summary_file="${summary_dir}/summary.md"
+  outputs_file="${summary_dir}/outputs"
+  record_dir="${summary_dir}/record"
+  : > "${summary_file}"
+  : > "${outputs_file}"
+  summary_args=(--ci buildkite --since "${start}" --checkout "${checkout_root}" --summary-out "${summary_file}" --outputs "${outputs_file}")
+  if [ "${keep_record}" = "true" ]; then
+    if mkdir -- "${record_dir}"; then
+      summary_args+=(--record-dir "${record_dir}")
+    else
+      echo "No build record, since its temporary directory could not be made."
+    fi
+  fi
+
+  summary_status=0
+  install_step node "${plugin_dir}/build-summary.mjs" "${summary_args[@]}" || summary_status=$?
+  if [ "${summary_status}" -ne 0 ]; then
+    echo "The build summary module exited ${summary_status}, so the summary may be incomplete."
+  fi
+
+  if ! command -v buildkite-agent > /dev/null 2>&1; then
+    echo "The build summary is not annotated, since buildkite-agent is not on this agent's PATH."
+    return 0
+  fi
+  # Keyed by job, since Buildkite documents no variable that tells the jobs of
+  # a matrix step apart, and a retry is a new job whose summary sits beside
+  # the earlier attempt's.
+  if [ -s "${summary_file}" ]; then
+    if [ -n "${BUILDKITE_JOB_ID:-}" ]; then
+      buildkite-agent annotate --style info --context "fjall-build-summary-${BUILDKITE_JOB_ID}" < "${summary_file}" || true
+    else
+      echo "The build summary is not annotated, since the job has no BUILDKITE_JOB_ID to name its annotation by."
+    fi
+  fi
+
+  # The module names the record it wrote. Only that name's one shape is
+  # uploaded, from the record directory, so the name can neither reach outside
+  # it nor pick another file.
+  if [ "${keep_record}" = "true" ]; then
+    record_name=""
+    while read -r line || [ -n "${line}" ]; do
+      case "${line}" in
+        record-name=*) record_name="${line#record-name=}" ;;
+      esac
+    done < "${outputs_file}"
+    if [ -z "${record_name}" ]; then
+      return 0
+    fi
+    record_name_pattern='^fjall-build-record-[0-9a-f]{8}\.dockerbuild$'
+    if ! [[ "${record_name}" =~ ${record_name_pattern} ]]; then
+      echo "The build record is not uploaded, since its name is not one build-summary.mjs writes. ${not_repeated}"
+    elif [ ! -f "${record_dir}/${record_name}" ]; then
+      echo "The build record is not uploaded, since build-summary.mjs named a record it did not write."
+    else
+      echo "Uploading the build record ${record_name} as an artifact. It holds build arg values, each Dockerfile's source and each step's log, unmasked, and anyone who can read this build can download it."
+      (cd -- "${record_dir}" && buildkite-agent artifact upload "${record_name}") || true
+    fi
+  fi
+)
 
 # With `supersede` set, the next marked build's hold reads this marker, the
 # job that started the deploy, against `fjall-deploy:result-job`, the job that
@@ -864,5 +964,8 @@ if command -v buildkite-agent > /dev/null 2>&1; then
       "Fjall stopped **${target}** before it completed: the approval gate refused the plan, or the run was cancelled. A cancelled run can stop after applying part of its change; the step log says which." || true
   fi
 fi
+
+# After the result is recorded, so the summary can never stand in its way.
+report_build_summary || true
 
 exit "${exit_code}"

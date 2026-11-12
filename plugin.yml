@@ -71,6 +71,10 @@ configuration:
     force:
       type: boolean
       default: false
+    build-record:
+      type: boolean
+      default: true
+      description: "Keep the builder's record of this run's images as a build artifact. It holds build arg values, each Dockerfile's source and each step's log, unmasked, which anyone who can read the build can download. On by default. A destroy and a tier target keep no record, since they build no image"
     supersede:
       type: object
       properties:
