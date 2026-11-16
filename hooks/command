@@ -36,7 +36,7 @@ export -n FJALL_API_KEY
 # minors/patches but never silently crosses into the next. Kept in lockstep with
 # both manifests' `cli-version` default and CI_RUN_INPUT_VOCABULARY's
 # COMPATIBLE_CLI_MAJOR by the ci-plugin parity test.
-fjall_cli_default_major="39"
+fjall_cli_default_major="40"
 
 # The `fjall` wrapper's declared `engines.node`. When the agent's node is below
 # this floor (or absent), the hook bootstraps node_version from nodejs.org.

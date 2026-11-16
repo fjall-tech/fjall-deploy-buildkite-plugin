@@ -14,7 +14,7 @@ A tier `target` (`organisation`, `platform`, or `account`) runs the tier's own c
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
 ```
@@ -83,7 +83,7 @@ runs longer than an hour fails part-way on this path too.
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
 ```
@@ -101,7 +101,7 @@ steps:
     plugins:
       - aws-assume-role-with-web-identity#v1.0.0:
           role-arn: arn:aws:iam::123456789012:role/deploy
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
 ```
@@ -122,7 +122,7 @@ steps:
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
       AWS_REGION: "us-east-1"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
 ```
@@ -153,7 +153,7 @@ example) fails when they expire.
 | `approval-token`    | no       | —        | Resume an approved plan from a prior plan run; not with `mode: deploy-only` or `image-tag`, which change no template                                                                                                                                                                                                                                           |
 | `build-args`        | no       | —        | Public build-time args, a list of `KEY=VALUE` strings                                                                                                                                                                                                                                                                                                          |
 | `build-secrets`     | no       | —        | Build secret refs, a list of `id=ID,ssm=PATH` (or `env=VAR`) strings                                                                                                                                                                                                                                                                                           |
-| `cli-version`       | no       | `39`     | Pin the `fjall` CLI version. Defaults to this plugin's compatible major (floats across `39`.x, never crossing into the next major); `auto` derives the major from the app's pinned `@fjall/components-infrastructure`; `latest` always installs the newest published release                                                                                   |
+| `cli-version`       | no       | `40`     | Pin the `fjall` CLI version. Defaults to this plugin's compatible major (floats across `40`.x, never crossing into the next major); `auto` derives the major from the app's pinned `@fjall/components-infrastructure`; `latest` always installs the newest published release                                                                                   |
 | `working-directory` | no       | `.`      | Folder that holds the project's `fjall/` folder, relative to the repository's checkout. `fjall` runs there                                                                                                                                                                                                                                                     |
 | `force`             | no       | `false`  | Deploy: deploy every stack, including those with no detected changes (CloudFormation leaves an unchanged stack as it is). Destroy: bypass the busy-stack guard and destroy while the target's stacks are mid-operation. App destroys skip destruction confirmation in CI regardless; a tier destroy still needs force to pass its non-interactive confirmation |
 | `build-record`      | no       | `true`   | Keep the builder's record of this run's images as a build artifact. It holds build arg values and each step's unmasked log, which anyone who can read the build can download. Needs buildx 0.23.0 or later. A destroy and a tier target keep no record, since they build no image. See [Keeping the build record](#keeping-the-build-record)                   |
@@ -236,7 +236,7 @@ Where a reader of the build shouldn't see what the builds used, set `build-recor
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v30:
+      - fjall-tech/fjall-deploy#v31:
           target: my-app
           deploy-target: production-use1
           build-record: false
@@ -262,7 +262,7 @@ steps:
     concurrency_group: "fjall-deploy-my-app"
     concurrency: 1
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
 ```
@@ -277,7 +277,7 @@ Set `supersede` when your pipeline creates a deploy build for each green commit 
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v30:
+      - fjall-tech/fjall-deploy#v31:
           target: my-app
           deploy-target: production-use1
           supersede:
@@ -351,7 +351,7 @@ An agent that cloned the plugin before the hold shipped runs a hook that never h
 steps:
   - label: ":construction: Infra"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
           mode: infra-only
@@ -365,7 +365,7 @@ A code-only deploy (`mode: deploy-only`) builds and rolls only what the assembly
 steps:
   - label: ":package: Code"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
           image-tag: "app-sha-4f9c2ab0d1e3"
@@ -377,7 +377,7 @@ steps:
 steps:
   - label: ":fire: Destroy"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           command: destroy
           target: my-app
           deploy-target: production-use1
@@ -392,7 +392,7 @@ steps:
 steps:
   - label: ":whale: API"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
           service: api
@@ -407,7 +407,7 @@ A tier `target` routes to the noun-verb tier command. This runs `fjall org deplo
 steps:
   - label: ":earth_africa: Organisation"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: organisation
           no-cascade: true
 ```
@@ -420,7 +420,7 @@ steps:
 steps:
   - label: ":rewind: Roll back"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
           image-tag: "sha-4f9c2ab"
@@ -434,10 +434,10 @@ Find valid tags with `fjall releases my-app` (each release records the image tag
 steps:
   - label: ":rocket: Deploy"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
-          cli-version: "39.0.0"
+          cli-version: "40.0.0"
 ```
 
 ### Staging to Production Pipeline
@@ -446,7 +446,7 @@ steps:
 steps:
   - label: ":test_tube: Staging"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           environment: staging
 
@@ -456,7 +456,7 @@ steps:
 
   - label: ":rocket: Production"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           environment: production
 ```
@@ -495,7 +495,7 @@ steps:
     env:
       NPM_CONFIG_CACHE: "/var/cache/fjall-deploy-npm"
     plugins:
-      - fjall-tech/fjall-deploy#v30.0.0:
+      - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
 ```
@@ -506,7 +506,7 @@ Keep the path absolute and outside the checkout. A service with no `docker.conte
 
 Two pins interact, and they move together:
 
-- **The plugin ref** — `fjall-tech/fjall-deploy#v30` is a moving major tag, repointed at the latest 30.x release on each plugin republish; `#v30.0.0` pins an exact release for maximum determinism.
+- **The plugin ref** — `fjall-tech/fjall-deploy#v31` is a moving major tag, repointed at the latest 31.x release on each plugin republish; `#v31.0.0` pins an exact release for maximum determinism.
 - **`cli-version`** — the `fjall` CLI the plugin installs per run; it defaults to the plugin major's compatible CLI major.
 
 Upgrade majors deliberately. A new plugin major either defaults to a new CLI major, or changes the plugin's own contract on the same CLI major, as v30 did: read its entry under [Breaking changes](#breaking-changes) before moving the ref, and when the CLI major changes, move any explicit `cli-version` pin in the same change.
