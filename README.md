@@ -196,6 +196,8 @@ A `superseded` build records no duration. It posts a warning annotation that nam
 
 A `plan-pending` result also posts a warning annotation (re-run instructions when the run printed an approval token, otherwise a note that the run stopped before it completed), and the step exits `2` so downstream steps can gate on it.
 
+A cancelled run that ended on a failure the cancel didn't cause, such as a call AWS refused or a database a destroy left, records `failure` and exits `1`.
+
 A run that builds images also posts their [build summary](#build-summary) as an info annotation, whatever its result, and uploads the builder's record of them as an artifact unless `build-record` is `false`.
 
 ## Build summary

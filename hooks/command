@@ -924,7 +924,8 @@ rm -f "${log_file}"
 # completed, which can stop after applying part of its change. The exit code
 # does not say which; only a pending plan prints an approval token. Classify
 # like the GitHub Action's `result` output; buildkite-agent is absent in
-# local/bats runs, so guard.
+# local/bats runs, so guard. A cancelled run that ended on a failure the cancel
+# didn't cause exits 1.
 if [ "${exit_code}" -eq 0 ]; then
   result="success"
 elif [ "${exit_code}" -eq 2 ]; then
