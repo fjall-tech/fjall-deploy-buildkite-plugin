@@ -430,6 +430,8 @@ Find valid tags with `fjall releases my-app` (each release records the image tag
 
 ### Pin CLI Version
 
+To pin an exact CLI release, put a version that `npm view fjall versions` lists in place of the placeholder.
+
 ```yaml
 steps:
   - label: ":rocket: Deploy"
@@ -437,7 +439,7 @@ steps:
       - fjall-tech/fjall-deploy#v31.0.0:
           target: my-app
           deploy-target: production-use1
-          cli-version: "40.0.0"
+          cli-version: "<exact version>"
 ```
 
 ### Staging to Production Pipeline
